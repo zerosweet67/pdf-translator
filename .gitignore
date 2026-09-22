@@ -1,0 +1,21 @@
+# dependencies / build output (GitHub Actions builds web/dist)
+node_modules/
+dist/
+.vite/
+.wrangler/
+
+# secrets: never commit
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.local
+.env.*.local
+.env.production
+*.secret
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db

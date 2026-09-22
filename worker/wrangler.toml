@@ -1,0 +1,32 @@
+name = "pdf-translator-worker"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Plain (non-secret) configuration. Secrets are NOT set here. Production:
+#   npx wrangler secret put OPENAI_API_KEY
+#   npx wrangler secret put INVITE_CODE
+#   npx wrangler secret put AUTH_SECRET     (random, at least 32 characters)
+# For local development put them in `.dev.vars` (git-ignored, see `.dev.vars.example`).
+[vars]
+# "openai" (default) or "anthropic"
+PROVIDER = "openai"
+
+# OpenAI: GPT-5.6 tier. "gpt-5.6-terra" balances quality and cost ($2 / $12 per 1M tokens);
+# "gpt-5.6-sol" is the flagship if quality still falls short.
+OPENAI_MODEL = "gpt-5.6-terra"
+# Reasoning depth for the Responses API: none | low | medium | high.
+# Translation is quality-first but should not burn heavy reasoning: "low".
+OPENAI_REASONING_EFFORT = "low"
+
+# Anthropic fallback settings (only used when PROVIDER = "anthropic")
+ANTHROPIC_MODEL = "claude-opus-5"
+TRANSLATION_EFFORT = "low"
+
+# Comma-separated allowlist of browser origins (scheme + host, NO repo path).
+# Replace YOUR-GITHUB-USERNAME with your GitHub account before `wrangler deploy`:
+#   site https://alice.github.io/pdf-translator/  →  origin https://alice.github.io
+ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,https://YOUR-GITHUB-USERNAME.github.io"
+
+[observability]
+enabled = true

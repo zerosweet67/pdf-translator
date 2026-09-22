@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` (git-ignored) for `wrangler dev`.
+# In production use `npx wrangler secret put <NAME>` for each of these instead.
+OPENAI_API_KEY=sk-replace-me
+# Invite code friends type on the first screen.
+INVITE_CODE=local-dev-invite
+# Signs session tokens. Random, at least 32 characters (see README for a generator).
+AUTH_SECRET=replace-with-at-least-32-random-characters
+# Only needed if PROVIDER=anthropic in wrangler.toml
+# ANTHROPIC_API_KEY=sk-ant-replace-me

@@ -1,0 +1,24 @@
+{
+  "name": "pdf-translator-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Browser-side PDF translation: PDF.js extraction + layout analysis, Worker translation, pdf-lib overlay export",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^5.4.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.0",
+    "vite": "^7.0.0",
+    "vitest": "latest"
+  }
+}

@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-Hant-TW" class="locked">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Translator</title>
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <h1>PDF Translator</h1>
+        <p class="subtitle user-only">將英文論文整理成中英對照版本，保留原始閱讀脈絡。</p>
+        <p class="subtitle dev-only">Developer Mode · layout analysis + translation test mode. The PDF never leaves your browser; only text blocks are sent to the Worker.</p>
+      </header>
+
+      <!-- Invite gate: shown until the Worker accepts the invite code (html.locked) -->
+      <section class="card invite-card" id="invite-card">
+        <form id="invite-form" novalidate>
+          <p class="invite-intro">這是目前的測試版本。<br />請輸入邀請碼以繼續。</p>
+          <label class="visually-hidden" for="invite-input">邀請碼</label>
+          <input
+            type="password"
+            id="invite-input"
+            class="invite-input"
+            name="invite-code"
+            placeholder="邀請碼"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            maxlength="256"
+            required
+          />
+          <button type="submit" class="btn btn-primary" id="invite-submit">進入</button>
+          <p class="error" id="invite-error" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <!-- Phase A: file selection -->
+      <section class="card" id="upload-card">
+        <div class="drop-zone" id="drop-zone" tabindex="0" role="button" aria-label="將 PDF 拖曳到這裡，或點擊選擇檔案">
+          <p class="drop-title">將 PDF 拖曳到這裡</p>
+          <p class="drop-or">或</p>
+          <button type="button" class="btn" id="choose-btn">點擊選擇檔案</button>
+          <p class="drop-hint user-only">支援可選取文字的 PDF</p>
+          <input type="file" id="file-input" accept="application/pdf,.pdf" hidden />
+        </div>
+        <p class="upload-note user-only" id="upload-note">建議 100 頁以內，處理時間依頁數而定。</p>
+
+        <div class="file-info" id="file-info" hidden>
+          <dl>
+            <dt>檔案名稱</dt>
+            <dd id="file-name"></dd>
+            <dt>檔案大小</dt>
+            <dd id="file-size"></dd>
+            <dt class="dev-only">Target language</dt>
+            <dd class="dev-only">Traditional Chinese (Taiwan)</dd>
+          </dl>
+          <button type="button" class="btn btn-primary dev-only" id="analyze-btn" disabled>Analyze PDF</button>
+        </div>
+
+        <p class="status dev-only" id="status" hidden></p>
+        <p class="error" id="error" role="alert" hidden></p>
+      </section>
+
+      <!-- User Mode: automatic analyze → translate → side-by-side PDF -->
+      <section class="card user-only" id="job-card" hidden aria-live="polite">
+        <div id="job-progress">
+          <div class="job-head">
+            <p class="job-title">正在處理文件…</p>
+            <span class="job-percent" id="job-percent">0%</span>
+          </div>
+          <p class="visually-hidden" id="job-stage">正在讀取 PDF...</p>
+          <progress class="job-bar" id="job-bar" max="100" value="0"></progress>
+          <ol class="job-steps" id="job-steps">
+            <li data-step="read">讀取 PDF</li>
+            <li data-step="analyze">分析版面</li>
+            <li data-step="translate">翻譯內容</li>
+            <li data-step="generate">產生對照 PDF</li>
+          </ol>
+        </div>
+        <div class="job-done" id="job-done" hidden>
+          <p class="job-done-title">翻譯完成</p>
+          <p class="job-note" id="job-note" hidden></p>
+          <a class="btn btn-primary btn-download" id="job-download">下載中英對照 PDF</a>
+        </div>
+        <p class="error" id="job-error" role="alert" hidden></p>
+        <button type="button" class="btn-text" id="job-reset" hidden>重新選擇檔案</button>
+      </section>
+
+      <!-- Phase B + C: analysis result -->
+      <section class="card dev-only" id="results" hidden>
+        <h2>PDF Analysis</h2>
+        <dl class="analysis">
+          <dt>File</dt>
+          <dd id="res-file"></dd>
+          <dt>Pages</dt>
+          <dd id="res-pages"></dd>
+          <dt>Text Items</dt>
+          <dd id="res-items"></dd>
+          <dt>Selectable Text</dt>
+          <dd id="res-selectable"></dd>
+          <dt>Detected Layout</dt>
+          <dd id="res-layout"></dd>
+          <dt>Body Font Size</dt>
+          <dd id="res-body-font"></dd>
+          <dt>Text Blocks</dt>
+          <dd id="res-blocks"></dd>
+          <dt>Translation Blocks</dt>
+          <dd id="res-translation-blocks"></dd>
+          <dt>Context Budget</dt>
+          <dd id="res-context"></dd>
+        </dl>
+        <p class="warning" id="warning" hidden></p>
+        <p class="unsupported" id="unsupported" hidden>
+          This PDF does not contain selectable text and is not supported in the current version.
+        </p>
+
+        <div class="toolbar" id="analysis-toolbar" hidden>
+          <button type="button" class="btn" id="blocks-toggle">Show Translation Blocks</button>
+          <button type="button" class="btn" id="debug-toggle">Show Debug Data</button>
+        </div>
+        <p class="hint" id="worker-info"></p>
+
+        <div id="blocks-panel" hidden>
+          <div class="panel-header">
+            <h3>Translation Blocks</h3>
+            <label class="checkbox"><input type="checkbox" id="blocks-only-translate" /> only blocks that will be translated</label>
+          </div>
+          <p class="hint">Tick <strong>test</strong> on 1–10 blocks to include them in the translation test.</p>
+          <div class="block-list" id="blocks-list"></div>
+        </div>
+
+        <div id="debug-panel" hidden>
+          <p class="hint">Showing the first <span id="debug-limit"></span> raw text items. Full data: <code>window.__pdfDebug</code>, layout: <code>window.__pdfLayout</code>, translations: <code>window.__translations</code>.</p>
+          <div class="debug-list" id="debug-list"></div>
+        </div>
+      </section>
+
+      <!-- Translation Test Mode -->
+      <section class="card dev-only" id="test-section" hidden>
+        <h2>Translation Test</h2>
+        <p class="hint">Translate only a handful of blocks first and check the quality by hand. The full translation stays locked until you confirm.</p>
+
+        <label class="field-label" for="terminology-input">Terminology map (optional) — one <code>english term = 中文</code> per line, or a JSON object. Merged over the Worker defaults.</label>
+        <textarea id="terminology-input" rows="4" spellcheck="false" placeholder="large language model = 大型語言模型&#10;look-ahead bias = 前瞻偏誤&#10;numerical reasoning = 數值推理"></textarea>
+        <p class="error" id="terminology-error" hidden></p>
+
+        <div class="toolbar">
+          <button type="button" class="btn" id="pick-sample-btn">Pick Sample Blocks</button>
+          <button type="button" class="btn" id="pick-abstract-btn">Select Abstract</button>
+          <button type="button" class="btn" id="clear-selection-btn">Clear Selection</button>
+          <button type="button" class="btn btn-primary" id="test-btn" disabled>Test Translation (0)</button>
+          <span class="hint" id="selection-info"></span>
+        </div>
+        <p class="status" id="test-status" hidden></p>
+
+        <div class="preview-list" id="test-list"></div>
+
+        <label class="checkbox confirm" id="test-ok-wrapper" hidden>
+          <input type="checkbox" id="test-ok-checkbox" />
+          The test translations look good. Unlock <strong>Translate Full PDF</strong>.
+        </label>
+      </section>
+
+      <!-- Full translation -->
+      <section class="card dev-only" id="full-section" hidden>
+        <h2>Full Translation</h2>
+        <div class="toolbar">
+          <button type="button" class="btn btn-primary" id="translate-btn" disabled>Translate Full PDF</button>
+          <button type="button" class="btn" id="retry-btn" hidden>Retry Failed</button>
+        </div>
+        <p class="status" id="translate-status" hidden></p>
+        <details class="unit-details" id="cost-stats" hidden open>
+          <summary>Translation Cost Stats</summary>
+          <pre class="block-geom" id="cost-stats-list"></pre>
+        </details>
+      </section>
+
+      <section class="card dev-only" id="preview" hidden>
+        <h2>Translation Preview</h2>
+        <p class="hint" id="preview-summary"></p>
+        <div class="preview-list" id="preview-list"></div>
+      </section>
+
+      <!-- Phase D–F: PDF export -->
+      <section class="card dev-only" id="export-section" hidden>
+        <h2>PDF Export</h2>
+        <p class="hint">
+          The original PDF is kept as the base. Only TITLE / HEADING / BODY / CAPTION text is masked line by line with white
+          rectangles and rewritten in Traditional Chinese. Check <strong>Show Bounding Boxes</strong> first: it draws red boxes
+          around the blocks that would be overlaid, without masking anything.
+        </p>
+        <p class="hint" id="export-summary"></p>
+        <p class="warning font-note" id="font-note" hidden></p>
+        <div class="toolbar export-toolbar">
+          <label class="field-inline" for="export-mode">Export mode
+            <select id="export-mode">
+              <option value="bilingual" selected>Side-by-Side Bilingual</option>
+              <option value="translated">Translated Only</option>
+            </select>
+          </label>
+          <label class="field-inline" for="render-range">Render range
+            <select id="render-range">
+              <option value="page1" selected>Page 1 only</option>
+              <option value="abstract">Abstract only</option>
+              <option value="first3">First 3 pages</option>
+              <option value="full">Full PDF</option>
+            </select>
+          </label>
+          <label class="checkbox"><input type="checkbox" id="render-debug" /> Show Bounding Boxes (debug PDF, no masking)</label>
+        </div>
+        <div class="toolbar">
+          <button type="button" class="btn btn-primary" id="generate-btn" disabled>Generate Translated PDF</button>
+          <a class="btn btn-download" id="download-link" hidden>Download translated.pdf</a>
+        </div>
+        <p class="status" id="render-status" hidden></p>
+        <progress id="render-progress" max="100" value="0" hidden></progress>
+        <p class="error" id="render-error" role="alert" hidden></p>
+        <details class="unit-details render-warnings" id="render-warnings" hidden>
+          <summary id="render-warnings-summary">Layout warnings</summary>
+          <pre class="block-geom" id="render-warnings-list"></pre>
+        </details>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,91 @@
+# Build web/ and publish it to GitHub Pages on every push to main.
+# The Worker is NOT deployed here (run `npx wrangler deploy` in worker/ by hand),
+# so no Cloudflare token ever has to live in this repository.
+#
+# One-time setup:
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions"
+#   Settings → Secrets and variables → Actions → Variables → New repository variable
+#     VITE_WORKER_URL = https://pdf-translator-worker.<subdomain>.workers.dev
+#   (a public URL, so a variable rather than a secret; it ends up in the JS bundle anyway)
+name: Deploy web to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; do not cancel a deployment that is already running.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Check VITE_WORKER_URL
+        env:
+          VITE_WORKER_URL: ${{ vars.VITE_WORKER_URL }}
+        run: |
+          if [ -z "$VITE_WORKER_URL" ]; then
+            echo "::error::Repository variable VITE_WORKER_URL is not set (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          fi
+          case "$VITE_WORKER_URL" in
+            https://*) ;;
+            *) echo "::error::VITE_WORKER_URL must be an https:// URL"; exit 1 ;;
+          esac
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        env:
+          VITE_WORKER_URL: ${{ vars.VITE_WORKER_URL }}
+          # "/pdf-translator" for a project site, "" for <user>.github.io / custom domain
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+        run: npm run build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

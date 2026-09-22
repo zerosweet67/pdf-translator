@@ -1,0 +1,909 @@
+:root {
+  color-scheme: light dark;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1c1f24;
+  --muted: #5f6672;
+  --border: #d9dde3;
+  --accent: #2456c8;
+  --accent-text: #ffffff;
+  --danger: #b3261e;
+  --warning-bg: #fff4d6;
+  --warning-text: #6b4c00;
+  --code-bg: #f0f2f5;
+
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --surface: #1e2126;
+    --text: #e7e9ee;
+    --muted: #9aa3b2;
+    --border: #343941;
+    --accent: #6f95ff;
+    --accent-text: #0d1220;
+    --danger: #ff7b72;
+    --warning-bg: #3b3010;
+    --warning-text: #ffd97a;
+    --code-bg: #12141a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 16px 64px;
+}
+
+.app-header h1 {
+  margin: 0 0 4px;
+  font-size: 1.75rem;
+}
+
+.subtitle {
+  margin: 0 0 24px;
+  color: var(--muted);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.card h2 {
+  margin: 0 0 16px;
+  font-size: 1.25rem;
+}
+
+/* Drop zone -------------------------------------------------------------- */
+
+.drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 40px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 120ms, background-color 120ms;
+}
+
+.drop-zone:hover,
+.drop-zone:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.drop-zone.is-dragover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.drop-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.drop-or {
+  margin: 8px 0 12px;
+  color: var(--muted);
+}
+
+/* Buttons ---------------------------------------------------------------- */
+
+.btn {
+  font: inherit;
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* File info + analysis lists --------------------------------------------- */
+
+.file-info {
+  margin-top: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 16px;
+  row-gap: 4px;
+}
+
+dt {
+  color: var(--muted);
+}
+
+dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.analysis {
+  margin-bottom: 16px;
+}
+
+/* Messages --------------------------------------------------------------- */
+
+.status {
+  margin: 16px 0 0;
+  color: var(--muted);
+}
+
+.error {
+  margin: 16px 0 0;
+  color: var(--danger);
+}
+
+.warning {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.unsupported {
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* Debug list ------------------------------------------------------------- */
+
+.debug-list {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.debug-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.debug-item h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.debug-item pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Toolbar ---------------------------------------------------------------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.panel-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.panel-header h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.checkbox {
+  color: var(--muted);
+  font-size: 0.9rem;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Tags ------------------------------------------------------------------- */
+
+.preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tag {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.tag-id {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.tag-type {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tag-title { border-color: #c026d3; }
+.tag-heading { border-color: #2563eb; }
+.tag-body { border-color: var(--border); }
+.tag-caption { border-color: #0d9488; }
+.tag-footnote { border-color: #ca8a04; }
+.tag-header, .tag-footer { border-color: #9ca3af; opacity: 0.8; }
+.tag-author, .tag-reference, .tag-other { border-color: #ef4444; opacity: 0.8; }
+
+.tag-merged { color: #7c3aed; border-color: #7c3aed; font-weight: 600; }
+.tag-incomplete { color: #b45309; border-color: #b45309; font-weight: 600; }
+
+.unit-details {
+  margin: 4px 0 8px;
+  font-size: 0.85rem;
+}
+
+.unit-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.tag-yes { color: #15803d; border-color: #15803d; }
+.tag-no { color: var(--danger); border-color: var(--danger); }
+
+.tag-status[data-status="done"],
+.tag-status[data-status="cached"] { color: #15803d; border-color: #15803d; }
+.tag-status[data-status="failed"] { color: var(--danger); border-color: var(--danger); }
+.tag-status[data-status="translating"] { color: var(--accent); border-color: var(--accent); }
+
+/* Preview + block lists -------------------------------------------------- */
+
+.preview-list,
+.block-list {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.preview-item,
+.block-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.block-item.is-skipped {
+  opacity: 0.65;
+}
+
+.label {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.original,
+.translation {
+  margin: 4px 0 0;
+  line-height: 1.6;
+}
+
+.translation.zh {
+  font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error-text {
+  color: var(--danger);
+}
+
+/* Test mode ------------------------------------------------------------- */
+
+.field-label {
+  display: block;
+  margin: 12px 0 6px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+textarea {
+  width: 100%;
+  font: inherit;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9rem;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--text);
+  resize: vertical;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pick-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.checkbox.confirm {
+  display: flex;
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #15803d;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.block-geom {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+/* PDF export ------------------------------------------------------------- */
+
+.export-toolbar {
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+select {
+  font: inherit;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.btn-download {
+  display: inline-block;
+  text-decoration: none;
+  border-color: #15803d;
+  color: #15803d;
+  font-weight: 600;
+}
+
+progress {
+  width: 100%;
+  height: 8px;
+  margin-top: 10px;
+  accent-color: var(--accent);
+}
+
+.render-warnings {
+  margin-top: 12px;
+}
+
+.render-warnings pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.tag-overlay { color: #15803d; border-color: #15803d; }
+.tag-no-overlay { color: var(--muted); border-style: dashed; }
+
+.font-note {
+  white-space: pre-line;
+  margin-top: 8px;
+}
+
+/* User Mode / Developer Mode ------------------------------------------------ */
+
+[hidden] {
+  display: none !important;
+}
+
+/* Default is User Mode; main.ts adds .debug to <html> for ?debug=true. */
+html:not(.debug) .dev-only,
+html.debug .user-only {
+  display: none !important;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* User Mode: a quiet single-column reading tool ---------------------------- *
+ * Warm paper background, near-black ink, one muted sage accent. Everything
+ * below is scoped to html:not(.debug), so Developer Mode keeps its layout.   */
+
+html:not(.debug) {
+  --bg: #f5f3ee;
+  --surface: #fbfaf7;
+  --text: #2b2a27;
+  --muted: #75726b;
+  --faint: #a19d94;
+  --border: #e2ddd3;
+  --border-strong: #cfc8bb;
+  --accent: #5e7a69;
+  --accent-hover: #4f6858;
+  --accent-soft: #e9eee9;
+  --accent-text: #fbfaf7;
+  --danger: #a4493d;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", "Noto Serif TC", "Songti TC", Georgia, serif;
+
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  letter-spacing: 0.01em;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not(.debug) {
+    --bg: #1d1e1c;
+    --surface: #242523;
+    --text: #e7e5df;
+    --muted: #a39f97;
+    --faint: #7c7a74;
+    --border: #3a3b37;
+    --border-strong: #4a4b46;
+    --accent: #9cb4a4;
+    --accent-hover: #b2c7b9;
+    --accent-soft: #2c332e;
+    --accent-text: #1d1e1c;
+    --danger: #e0907f;
+  }
+}
+
+html:not(.debug) body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+html:not(.debug) .app {
+  max-width: 560px;
+  padding: clamp(56px, 14vh, 136px) 20px 96px;
+}
+
+html:not(.debug) .app-header {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+html:not(.debug) .app-header h1 {
+  margin: 0 0 12px;
+  font-family: var(--serif);
+  font-size: 2.1rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+html:not(.debug) .subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1rem;
+}
+
+/* no heavy cards: the upload area and the status block sit on the page */
+html:not(.debug) .card {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin-bottom: 28px;
+}
+
+html:not(.debug) .drop-zone {
+  border: 1.5px dashed var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 48px 24px 40px;
+  transition: border-color 150ms, background-color 150ms;
+}
+
+html:not(.debug) .drop-zone:hover,
+html:not(.debug) .drop-zone:focus-visible {
+  border-color: var(--accent);
+}
+
+html:not(.debug) .drop-zone.is-dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+html:not(.debug) .drop-title {
+  font-size: 1.05rem;
+  font-weight: 500;
+}
+
+html:not(.debug) .drop-or {
+  margin: 6px 0 14px;
+  color: var(--faint);
+  font-size: 0.9rem;
+}
+
+html:not(.debug) .drop-hint {
+  margin: 18px 0 0;
+  color: var(--faint);
+  font-size: 0.85rem;
+}
+
+html:not(.debug) .upload-note {
+  margin: 14px 0 0;
+  text-align: center;
+  color: var(--faint);
+  font-size: 0.85rem;
+}
+
+/* buttons: one clear primary, everything else light */
+html:not(.debug) .btn {
+  padding: 8px 20px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.95rem;
+  transition: border-color 150ms, background-color 150ms, color 150ms;
+}
+
+html:not(.debug) .btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+html:not(.debug) .btn-primary,
+html:not(.debug) .job-done .btn-download {
+  display: inline-block;
+  padding: 11px 28px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+html:not(.debug) .btn-primary:hover:not(:disabled),
+html:not(.debug) .job-done .btn-download:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+  color: var(--accent-text);
+}
+
+.btn-text {
+  display: block;
+  margin: 18px auto 0;
+  padding: 4px 8px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.9rem;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 4px;
+  cursor: pointer;
+}
+
+.btn-text:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+
+/* selected file: one quiet line */
+html:not(.debug) .file-info {
+  margin-top: 0;
+  justify-content: center;
+}
+
+html:not(.debug) .file-info dl {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+html:not(.debug) .file-info dt {
+  display: none;
+}
+
+html:not(.debug) .file-info dd {
+  word-break: break-word;
+  text-align: center;
+}
+
+html:not(.debug) .file-info dd#file-name {
+  color: var(--text);
+}
+
+html:not(.debug) .drop-zone:not([hidden]) + .upload-note + .file-info {
+  margin-top: 18px;
+}
+
+html:not(.debug) .error {
+  color: var(--danger);
+  text-align: center;
+}
+
+/* progress and completion block */
+html:not(.debug) #job-card {
+  padding: 28px 32px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.job-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.job-title,
+.job-stage {
+  margin: 0;
+  font-weight: 500;
+}
+
+.job-percent {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.job-bar {
+  width: 100%;
+  height: 4px;
+  margin: 14px 0 20px;
+  accent-color: var(--accent);
+}
+
+html:not(.debug) .job-bar {
+  appearance: none;
+  border: 0;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+html:not(.debug) .job-bar::-webkit-progress-bar {
+  background: var(--border);
+}
+
+html:not(.debug) .job-bar::-webkit-progress-value {
+  background: var(--accent);
+  transition: width 300ms ease;
+}
+
+html:not(.debug) .job-bar::-moz-progress-bar {
+  background: var(--accent);
+}
+
+.job-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--faint);
+  font-size: 0.92rem;
+}
+
+.job-steps li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 3px 0;
+}
+
+.job-steps li::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--faint);
+  border-radius: 50%;
+}
+
+.job-steps li.is-active {
+  color: var(--text);
+}
+
+.job-steps li.is-active::before {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.job-steps li.is-done {
+  color: var(--muted);
+}
+
+.job-steps li.is-done::before {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.job-done {
+  text-align: center;
+}
+
+.job-done-title {
+  margin: 4px 0 20px;
+  font-family: var(--serif);
+  font-size: 1.4rem;
+  font-weight: 500;
+}
+
+.job-note {
+  margin: -8px 0 20px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+#job-card .error {
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  html:not(.debug) #job-card {
+    padding: 24px 20px;
+  }
+
+  html:not(.debug) .app-header h1 {
+    font-size: 1.8rem;
+  }
+}
+
+/* Invite gate --------------------------------------------------------------- *
+ * <html class="locked"> is the initial state (set in index.html so the tool
+ * never flashes before main.ts runs); main.ts removes it once a session exists. */
+
+html.locked main.app > section:not(#invite-card),
+html.locked .subtitle {
+  display: none !important;
+}
+
+html:not(.locked) #invite-card {
+  display: none !important;
+}
+
+.invite-card form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.invite-intro {
+  margin: 0 0 4px;
+  color: var(--muted);
+}
+
+.invite-input {
+  width: 100%;
+  max-width: 320px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: center;
+  letter-spacing: 0.08em;
+}
+
+.invite-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft, transparent);
+}
+
+.invite-card .error {
+  margin: 0;
+}
