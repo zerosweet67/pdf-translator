@@ -24,9 +24,9 @@ ANTHROPIC_MODEL = "claude-opus-5"
 TRANSLATION_EFFORT = "low"
 
 # Comma-separated allowlist of browser origins (scheme + host, NO repo path).
-# Replace YOUR-GITHUB-USERNAME with your GitHub account before `wrangler deploy`:
+# Production GitHub Pages origin:
 #   site https://alice.github.io/pdf-translator/  →  origin https://alice.github.io
-ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,https://YOUR-GITHUB-USERNAME.github.io"
+ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,https://zerosweet67.github.io"
 
 [observability]
 enabled = true
