@@ -57,6 +57,11 @@ jobs:
             https://*) ;;
             *) echo "::error::VITE_WORKER_URL must be an https:// URL"; exit 1 ;;
           esac
+          # Only the Worker origin, e.g. https://x.workers.dev — no /health or other path.
+          if [ -n "$(echo "${VITE_WORKER_URL#https://}" | sed 's#/*$##' | grep '/')" ]; then
+            echo "::error::VITE_WORKER_URL must not contain a path (remove /health etc.): $VITE_WORKER_URL"
+            exit 1
+          fi
 
       - name: Install
         run: npm ci
