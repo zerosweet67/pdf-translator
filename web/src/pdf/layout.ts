@@ -7,16 +7,19 @@
  * Classification (TITLE / BODY / ...) and translate decisions live in classify.ts.
  */
 
-import { classifyBlocks } from './classify';
+import { classifyBlocks, isAbbreviationOnly, isUntranslatableText } from './classify';
 import { buildTranslationBlocks, contextStats } from './merge';
+import { buildTableCells, type ResolvedCell, type TableItemRef } from './table';
 import { joinLines } from './text';
 import type {
   ColumnLayout,
   ColumnRegion,
+  DetailedBlockType,
   LayoutResult,
   PageDebugInfo,
   PageLayout,
   PdfAnalysis,
+  TableSummary,
   TextBlock,
   TextItemDebug,
   TextLine,
@@ -406,10 +409,183 @@ function orderBlocks(blocks: TextBlock[], layout: ColumnLayout): TextBlock[] {
 }
 
 // ---------------------------------------------------------------------------
+// Step 5: table blocks → logical cells (see table.ts)
+// ---------------------------------------------------------------------------
+
+/** One TextBlock per logical cell, in place of the paragraph-style TABLE blocks classify.ts produced. */
+function cellBlock(cell: ResolvedCell, template: TextBlock): TextBlock {
+  const info = cell.info;
+  const lines: TextLine[] = cell.fragments.map((f) => ({
+    page: template.page,
+    text: f.text + (f.trailingMarker ?? ''),
+    x: f.x,
+    y: f.y,
+    width: round(f.right - f.x),
+    height: round(f.fontSize),
+    fontSize: f.fontSize,
+    fontName: f.fontName,
+    fontRealName: f.fontRealName,
+    column: template.column,
+    items: f.items.map((r) => r.item),
+  }));
+  const first = cell.fragments[0];
+  let blockType: DetailedBlockType;
+  let skipReason: string | null = null;
+  if (info.numeric) {
+    blockType = 'TABLE_CELL';
+    skipReason = 'NUMERIC_ONLY';
+  } else {
+    blockType = info.header ? 'TABLE_HEADER' : 'TABLE_TEXT_LABEL';
+    if (isAbbreviationOnly(cell.text)) skipReason = 'ABBREVIATION_ONLY';
+    else if (isUntranslatableText(cell.text)) skipReason = 'UNTRANSLATABLE';
+  }
+  return {
+    id: info.id,
+    page: template.page,
+    type: 'TABLE',
+    sectionType: template.sectionType,
+    blockType,
+    text: cell.text,
+    x: info.textBox.x,
+    y: info.textBox.y,
+    width: info.textBox.width,
+    height: info.textBox.height,
+    top: round(info.textBox.y + info.textBox.height),
+    fontSize: info.fontSize,
+    fontName: first.fontName,
+    fontRealName: first.fontRealName,
+    column: template.column,
+    lineCount: lines.length,
+    lines,
+    order: -1,
+    translate: skipReason === null,
+    skipReason,
+    tableId: info.tableId,
+    cell: info,
+  };
+}
+
+/**
+ * Regroup the TABLE blocks of every (page, table) into logical cells. A table
+ * whose cells cannot be resolved keeps its blocks but they are no longer
+ * translated (English is safer than overlapping Chinese).
+ */
+function resolveTables(blocks: TextBlock[], analysis: PdfAnalysis): { blocks: TextBlock[]; tables: TableSummary[] } {
+  const groups = new Map<string, TextBlock[]>();
+  for (const b of blocks) {
+    if (b.type !== 'TABLE' || b.tableId === undefined) continue;
+    const key = `${b.page}:${b.tableId}`;
+    const list = groups.get(key) ?? [];
+    list.push(b);
+    groups.set(key, list);
+  }
+  if (groups.size === 0) return { blocks, tables: [] };
+
+  const itemIndex = new Map<TextItemDebug, number>();
+  analysis.items.forEach((item, i) => itemIndex.set(item, i));
+  const pageById = new Map(analysis.pages.map((p) => [p.pageNumber, p]));
+
+  // On a two-column page the right-hand cells of a full-width table come after
+  // the left column in reading order, past the table note, and end up as OTHER
+  // fragments. Short OTHER blocks inside the table's vertical band belong to it.
+  const absorbed = new Map<string, string>(); // block id → group key
+  for (const [key, group] of groups) {
+    const page = group[0].page;
+    const top = Math.max(...group.map((b) => b.top));
+    const bottom = Math.min(...group.map((b) => b.y));
+    const fs = group[0].fontSize;
+    for (const b of blocks) {
+      if (b.page !== page || b.type !== 'OTHER' || b.tableId !== undefined || absorbed.has(b.id)) continue;
+      if (b.lineCount > 2 || b.text.split(/\s+/).length > 12) continue;
+      if (b.top > top + 2 || b.y < bottom - 2) continue;
+      if (b.fontSize < 0.75 * fs || b.fontSize > 1.3 * fs) continue;
+      group.push(b);
+      absorbed.set(b.id, key);
+    }
+  }
+
+  const replacement = new Map<string, TextBlock[]>();
+  const tables: TableSummary[] = [];
+  for (const [key, group] of groups) {
+    const first = group[0];
+    const pageInfo = pageById.get(first.page);
+    const items: TableItemRef[] = [];
+    for (const b of group) {
+      for (const line of b.lines) {
+        for (const item of line.items) items.push({ index: itemIndex.get(item) ?? -1, item });
+      }
+    }
+    const result = buildTableCells({
+      page: first.page,
+      tableId: first.tableId as number,
+      items,
+      rules: pageInfo?.rules ?? [],
+      fills: pageInfo?.fills ?? [],
+    });
+    if (result.ok) {
+      const cells = result.cells.map((c) => cellBlock(c, first));
+      replacement.set(key, cells);
+      tables.push({
+        page: first.page,
+        tableId: first.tableId as number,
+        resolved: true,
+        rows: result.rows,
+        columns: result.columns,
+        cells: cells.length,
+        translatedCells: cells.filter((c) => c.translate).length,
+        numericCells: cells.filter((c) => c.cell?.numeric).length,
+        headerCells: cells.filter((c) => c.cell?.header).length,
+        reason: null,
+      });
+    } else {
+      for (const b of group) {
+        b.translate = false;
+        b.skipReason = `TABLE_UNRESOLVED:${result.reason}`;
+      }
+      replacement.set(key, group);
+      tables.push({
+        page: first.page,
+        tableId: first.tableId as number,
+        resolved: false,
+        rows: 0,
+        columns: 0,
+        cells: 0,
+        translatedCells: 0,
+        numericCells: 0,
+        headerCells: 0,
+        reason: result.reason,
+      });
+    }
+  }
+
+  const out: TextBlock[] = [];
+  const emitted = new Set<string>();
+  for (const b of blocks) {
+    const key = b.type === 'TABLE' && b.tableId !== undefined ? `${b.page}:${b.tableId}` : absorbed.get(b.id);
+    if (key !== undefined) {
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      out.push(...(replacement.get(key) ?? [b]));
+    } else {
+      out.push(b);
+    }
+  }
+  out.forEach((b, i) => {
+    b.order = i;
+  });
+  return { blocks: out, tables };
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-export function analyzeLayout(analysis: PdfAnalysis): LayoutResult {
+export interface LayoutOptions {
+  /** Regroup TABLE blocks into logical cells (default true; false = the paragraph-style blocks, for A/B comparison). */
+  resolveTables?: boolean;
+}
+
+export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}): LayoutResult {
   const bodyFontSize = computeBodyFontSize(analysis.items);
   const itemsByPage = new Map<number, TextItemDebug[]>();
   for (const item of analysis.items) {
@@ -461,25 +637,34 @@ export function analyzeLayout(analysis: PdfAnalysis): LayoutResult {
 
   classifyBlocks(allBlocks, analysis.pages, bodyFontSize);
 
-  const translationBlocks: TranslationBlock[] = buildTranslationBlocks(allBlocks);
+  const resolved = options.resolveTables === false ? { blocks: allBlocks, tables: [] } : resolveTables(allBlocks, analysis);
+  const finalBlocks = resolved.blocks;
+  const translationBlocks: TranslationBlock[] = buildTranslationBlocks(finalBlocks);
 
   const twoColumnPages = pageLayouts.filter((p) => p.layout === 'TWO_COLUMN').length;
   const context = contextStats(translationBlocks);
+  const tables = resolved.tables;
 
   return {
     bodyFontSize,
     pages: pageLayouts,
-    blocks: allBlocks,
+    blocks: finalBlocks,
     translationBlocks,
+    tables,
     stats: {
       lineCount,
-      blockCount: allBlocks.length,
+      blockCount: finalBlocks.length,
       translationBlockCount: translationBlocks.length,
       mergedBlockCount: translationBlocks.filter((b) => b.wasMerged).length,
       incompleteBlockCount: translationBlocks.filter((b) => b.incompleteSource).length,
       twoColumnPages,
       singleColumnPages: pageLayouts.length - twoColumnPages,
       ...context,
+      tableCount: tables.length,
+      tableCellCount: tables.reduce((n, t) => n + t.cells, 0),
+      tableTranslatedCells: tables.reduce((n, t) => n + t.translatedCells, 0),
+      tableNumericCells: tables.reduce((n, t) => n + t.numericCells, 0),
+      tableUnresolvedCount: tables.filter((t) => !t.resolved).length,
     },
   };
 }

@@ -306,6 +306,7 @@ code {
 
 .tag-merged { color: #7c3aed; border-color: #7c3aed; font-weight: 600; }
 .tag-incomplete { color: #b45309; border-color: #b45309; font-weight: 600; }
+.tag-qa { color: #be123c; border-color: #be123c; }
 
 .unit-details {
   margin: 4px 0 8px;

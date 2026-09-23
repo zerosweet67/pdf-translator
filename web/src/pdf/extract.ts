@@ -16,7 +16,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 // `vite dev` and in the production bundle (respecting `base`). This is what
 // prevents the classic "works locally, worker 404 on GitHub Pages" problem.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import type { ImageBox, PageDebugInfo, PdfAnalysis, TextItemDebug } from './types';
+import type { FilledRect, ImageBox, PageDebugInfo, PdfAnalysis, RuleLine, TextItemDebug } from './types';
 import { normalizeSymbolFontText } from './symbols';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -61,12 +61,67 @@ function unitSquareBox(ctm: Matrix): ImageBox {
   return { x: round(x0), y: round(y0), width: round(Math.max(...xs) - x0), height: round(Math.max(...ys) - y0) };
 }
 
+/** What the operator-list walk collects for one page. */
+export interface PageGraphics {
+  images: ImageBox[];
+  rules: RuleLine[];
+  fills: FilledRect[];
+}
+
+/** Thin straight paths up to this thickness (points) count as rules. */
+const RULE_MAX_THICKNESS = 2.5;
+/** Rules shorter than this (points) are ignored (tick marks, underlines of single glyphs). */
+const RULE_MIN_LENGTH = 6;
+/** Filled rectangles smaller than this area (pt²) are ignored (bullets, icons). */
+const FILL_MIN_AREA = 40;
+/** Safety cap so a page made of thousands of tiny paths cannot blow up memory. */
+const MAX_GRAPHICS_PER_PAGE = 4000;
+
+/** Transform an axis-aligned box [minX, minY, maxX, maxY] by `ctm` and return the resulting bounding box. */
+function transformedBox(minMax: number[], ctm: Matrix): [number, number, number, number] {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const [ux, uy] of [
+    [minMax[0], minMax[1]],
+    [minMax[2], minMax[1]],
+    [minMax[0], minMax[3]],
+    [minMax[2], minMax[3]],
+  ]) {
+    xs.push(ctm[0] * ux + ctm[2] * uy + ctm[4]);
+    ys.push(ctm[1] * ux + ctm[3] * uy + ctm[5]);
+  }
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/** PDF.js reports fill colours as "#rrggbb" strings; anything else is unknown. */
+function fillColorOf(args: unknown): string | null {
+  if (Array.isArray(args) && typeof args[0] === 'string' && /^#[0-9a-f]{6}$/i.test(args[0])) return args[0].toLowerCase();
+  return null;
+}
+
+/** True when a path's draw ops describe straight segments only (no curves). */
+function isStraightPath(data: unknown): boolean {
+  if (!Array.isArray(data)) return false;
+  for (const sub of data) {
+    const arr = sub as ArrayLike<number>;
+    let i = 0;
+    while (i < arr.length) {
+      const op = arr[i];
+      if (op === 0 || op === 1) i += 3; // moveTo / lineTo x y
+      else if (op === 4) i += 1; // closePath
+      else return false; // curveTo / quadraticCurveTo
+    }
+  }
+  return true;
+}
+
 /**
- * Walk the page's operator list and record where raster images land.
- * Tracks q/Q, cm and form XObjects; annotations are excluded. Vector graphics
- * (paths) are not tracked, so a chart drawn with lines is invisible here.
+ * Walk the page's operator list and record where raster images land, plus
+ * thin straight paths (table rules) and filled rectangles (row shading).
+ * Tracks q/Q, cm and form XObjects; annotations are excluded. Charts drawn
+ * with curves are ignored.
  */
-async function collectImageBoxes(page: pdfjsLib.PDFPageProxy): Promise<ImageBox[]> {
+async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGraphics> {
   const OPS = pdfjsLib.OPS;
   const imageOps = new Set<number>(
     [
@@ -80,41 +135,109 @@ async function collectImageBoxes(page: pdfjsLib.PDFPageProxy): Promise<ImageBox[
     ].filter((op): op is number => typeof op === 'number'),
   );
 
+  // Painting operators that end a constructPath (see PDF.js OPS): stroke,
+  // closeStroke, fill, eoFill, fillStroke, eoFillStroke, closeFillStroke, closeEOFillStroke.
+  const strokeOps = new Set<number>([OPS.stroke, OPS.closeStroke].filter((op): op is number => typeof op === 'number'));
+  const fillOps = new Set<number>(
+    [OPS.fill, OPS.eoFill, OPS.fillStroke, OPS.eoFillStroke, OPS.closeFillStroke, OPS.closeEOFillStroke].filter(
+      (op): op is number => typeof op === 'number',
+    ),
+  );
+
   const opList = await page.getOperatorList({ annotationMode: pdfjsLib.AnnotationMode.DISABLE });
   const boxes: ImageBox[] = [];
-  const stack: Matrix[] = [];
+  const rules: RuleLine[] = [];
+  const fills: FilledRect[] = [];
+  interface GState {
+    ctm: Matrix;
+    fill: string | null;
+    lineWidth: number;
+  }
+  const stack: GState[] = [];
   let ctm: Matrix = [1, 0, 0, 1, 0, 0];
+  let fillColor: string | null = null;
+  let lineWidth = 1;
   let annotationDepth = 0;
+
+  const addRuleOrFill = (paintOp: number, data: unknown, minMax: unknown) => {
+    if (annotationDepth > 0 || rules.length + fills.length >= MAX_GRAPHICS_PER_PAGE) return;
+    // minMax is a Float32Array [minX, minY, maxX, maxY] in the path's own coordinate space.
+    const mm = minMax as ArrayLike<number> | null;
+    if (!mm || typeof mm !== 'object' || mm.length !== 4) return;
+    const box = [mm[0], mm[1], mm[2], mm[3]];
+    if (!box.every((v) => typeof v === 'number' && Number.isFinite(v))) return;
+    if (!isStraightPath(data)) return;
+    const [x0, y0, x1, y1] = transformedBox(box, ctm);
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const scale = Math.sqrt(Math.abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) || 1;
+    const stroked = strokeOps.has(paintOp);
+    const filled = fillOps.has(paintOp);
+    if (!stroked && !filled) return;
+    const thickness = stroked ? Math.max(lineWidth * scale, 0.1) : Math.min(w, h);
+    const horizontal = h <= RULE_MAX_THICKNESS && w >= RULE_MIN_LENGTH && w > h * 3;
+    const vertical = w <= RULE_MAX_THICKNESS && h >= RULE_MIN_LENGTH && h > w * 3;
+    if (horizontal || vertical) {
+      const cx = (x0 + x1) / 2;
+      const cy = (y0 + y1) / 2;
+      rules.push(
+        horizontal
+          ? { orientation: 'horizontal', x0: round(x0), y0: round(cy), x1: round(x1), y1: round(cy), thickness: round(thickness) }
+          : { orientation: 'vertical', x0: round(cx), y0: round(y0), x1: round(cx), y1: round(y1), thickness: round(thickness) },
+      );
+      return;
+    }
+    if (filled && w * h >= FILL_MIN_AREA) {
+      fills.push({ x: round(x0), y: round(y0), width: round(w), height: round(h), color: fillColor });
+    }
+  };
+
+  const restoreState = () => {
+    const g = stack.pop();
+    if (!g) return;
+    ctm = g.ctm;
+    fillColor = g.fill;
+    lineWidth = g.lineWidth;
+  };
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
     const args = opList.argsArray[i] as unknown;
     switch (fn) {
       case OPS.save:
-        stack.push(ctm);
+        stack.push({ ctm, fill: fillColor, lineWidth });
         break;
       case OPS.restore:
-        ctm = stack.pop() ?? ctm;
+        restoreState();
         break;
       case OPS.transform:
         if (isMatrix(args)) ctm = multiplyMatrix(args, ctm);
         break;
+      case OPS.setLineWidth:
+        if (Array.isArray(args) && typeof args[0] === 'number') lineWidth = args[0];
+        break;
+      case OPS.setFillRGBColor:
+        fillColor = fillColorOf(args);
+        break;
+      case OPS.constructPath:
+        if (Array.isArray(args) && typeof args[0] === 'number') addRuleOrFill(args[0], args[1], args[2]);
+        break;
       case OPS.paintFormXObjectBegin: {
-        stack.push(ctm);
+        stack.push({ ctm, fill: fillColor, lineWidth });
         const matrix = Array.isArray(args) ? (args as unknown[])[0] : null;
         if (isMatrix(matrix)) ctm = multiplyMatrix(matrix, ctm);
         break;
       }
       case OPS.paintFormXObjectEnd:
-        ctm = stack.pop() ?? ctm;
+        restoreState();
         break;
       case OPS.beginAnnotation:
         annotationDepth++;
-        stack.push(ctm);
+        stack.push({ ctm, fill: fillColor, lineWidth });
         break;
       case OPS.endAnnotation:
         annotationDepth = Math.max(0, annotationDepth - 1);
-        ctm = stack.pop() ?? ctm;
+        restoreState();
         break;
       default:
         if (imageOps.has(fn) && annotationDepth === 0) {
@@ -123,7 +246,7 @@ async function collectImageBoxes(page: pdfjsLib.PDFPageProxy): Promise<ImageBox[
         }
     }
   }
-  return boxes;
+  return { images: boxes, rules, fills };
 }
 
 // Derive the text item types from PDF.js itself so we do not depend on
@@ -251,13 +374,14 @@ export async function extractPdf(
         pageItems.push(item);
       }
 
-      // Image placement for the overlay phase. Never fatal: a page whose
-      // operator list cannot be read simply reports no images.
-      let images: ImageBox[] = [];
+      // Image placement for the overlay phase, table rules and fills for the
+      // table renderer. Never fatal: a page whose operator list cannot be read
+      // simply reports none.
+      let graphics: PageGraphics = { images: [], rules: [], fills: [] };
       try {
-        images = await collectImageBoxes(page);
+        graphics = await collectPageGraphics(page);
       } catch (err) {
-        console.warn(`[extractPdf] image detection failed on page ${pageNumber}:`, err);
+        console.warn(`[extractPdf] image / rule detection failed on page ${pageNumber}:`, err);
       }
 
       // Late font names, then Symbol-font PUA normalization (U+F05B → "[", U+F044 → Δ, ...).
@@ -280,7 +404,9 @@ export async function extractPdf(
         rotation: viewport.rotation,
         view: page.view.map((v) => round(v)),
         textItemCount: pageItemCount,
-        images,
+        images: graphics.images,
+        rules: graphics.rules,
+        fills: graphics.fills,
       });
 
       page.cleanup();

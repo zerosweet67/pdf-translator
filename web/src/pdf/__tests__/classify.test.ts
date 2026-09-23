@@ -56,6 +56,8 @@ function pages(n: number): PageDebugInfo[] {
     view: [0, 0, PAGE_W, PAGE_H],
     textItemCount: 10,
     images: [],
+    rules: [],
+    fills: [],
   }));
 }
 

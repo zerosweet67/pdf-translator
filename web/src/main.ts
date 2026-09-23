@@ -34,9 +34,10 @@ import {
 import type { FontSetBytes } from './pdf/font';
 import type { RenderProgress } from './pdf/render';
 import type { LayoutResult, PdfAnalysis, TextBlock, TextItemDebug, TranslationBlock, TranslationEntry } from './pdf/types';
-import { translateBlocks, type TranslateBlocksOptions, type TranslationStats } from './translate/batch';
+import type { TranslationStats } from './translate/batch';
 import { TranslationCache } from './translate/cache';
-import { TranslateClient } from './translate/client';
+import { TranslateClient, type WorkerUsage } from './translate/client';
+import { translateDocument, type DocumentTranslationOptions, type DocumentTranslationResult } from './translate/pipeline';
 import { clearSession, getSessionToken, saveSession } from './translate/session';
 import { WORKER_URL } from './config';
 
@@ -92,6 +93,10 @@ const blocksPanel = byId<HTMLDivElement>('blocks-panel');
 const blocksOnlyTranslate = byId<HTMLInputElement>('blocks-only-translate');
 const blocksList = byId<HTMLDivElement>('blocks-list');
 
+const tableDiagnostics = byId<HTMLDetailsElement>('table-diagnostics');
+const tableDiagnosticsSummary = byId<HTMLElement>('table-diagnostics-summary');
+const tableDiagnosticsCells = byId<HTMLInputElement>('table-diagnostics-cells');
+const tableDiagnosticsList = byId<HTMLPreElement>('table-diagnostics-list');
 const debugPanel = byId<HTMLDivElement>('debug-panel');
 const debugLimitEl = byId<HTMLElement>('debug-limit');
 const debugList = byId<HTMLDivElement>('debug-list');
@@ -117,6 +122,12 @@ const retryBtn = byId<HTMLButtonElement>('retry-btn');
 const translateStatus = byId<HTMLParagraphElement>('translate-status');
 const costStats = byId<HTMLDetailsElement>('cost-stats');
 const costStatsList = byId<HTMLPreElement>('cost-stats-list');
+const terminologyPanel = byId<HTMLDetailsElement>('terminology-panel');
+const terminologySummary = byId<HTMLElement>('terminology-summary');
+const terminologyList = byId<HTMLPreElement>('terminology-list');
+const qaPanel = byId<HTMLDetailsElement>('qa-panel');
+const qaSummary = byId<HTMLElement>('qa-summary');
+const qaList = byId<HTMLPreElement>('qa-list');
 const previewEl = byId<HTMLElement>('preview');
 const previewSummary = byId<HTMLParagraphElement>('preview-summary');
 const previewList = byId<HTMLDivElement>('preview-list');
@@ -174,6 +185,8 @@ let isGenerating = false;
 /** Object URL of the last generated PDF, revoked when replaced or reset. */
 let generatedUrl: string | null = null;
 let providerLabel = 'OpenAI';
+/** Last PDF export, for the table diagnostics (overflow / fallback cells). */
+let lastRenderResult: RenderResult | null = null;
 
 /**
  * One job per selected file. Selecting another file aborts the previous job:
@@ -296,6 +309,9 @@ function resetResults(): void {
   debugPanel.hidden = true;
   debugList.replaceChildren();
   debugToggle.textContent = 'Show Debug Data';
+  tableDiagnostics.hidden = true;
+  tableDiagnosticsList.textContent = '';
+  lastRenderResult = null;
 
   testSection.hidden = true;
   testList.replaceChildren();
@@ -306,6 +322,10 @@ function resetResults(): void {
   fullSection.hidden = true;
   costStats.hidden = true;
   costStatsList.textContent = '';
+  terminologyPanel.hidden = true;
+  terminologyList.textContent = '';
+  qaPanel.hidden = true;
+  qaList.textContent = '';
   translateBtn.disabled = true;
   retryBtn.hidden = true;
   setTranslateStatus(null);
@@ -599,6 +619,75 @@ function describeLayout(layout: LayoutResult): string {
   return `Two Columns on ${twoColumnPages} page(s) [${twoCol.slice(0, 12).join(', ')}${twoCol.length > 12 ? ', …' : ''}], Single on ${singleColumnPages}`;
 }
 
+/**
+ * Developer Mode: detected tables, logical cells, numeric cells kept in
+ * English, and (after an export) the cells that overflowed and fell back to
+ * English, with page / table / row / column / source text / final font size.
+ */
+function renderTableDiagnostics(layout: LayoutResult, render: RenderResult | null): void {
+  const st = layout.stats;
+  const cellReports = render ? render.reports.filter((r) => r.cell) : [];
+  const overflow = cellReports.filter((r) => r.reason === 'TABLE_CELL_OVERFLOW');
+  const written = render ? render.stats.tableCellsWritten : 0;
+  tableDiagnosticsSummary.textContent =
+    `Table Diagnostics: ${st.tableCount} table(s) · ${st.tableCellCount} cells · ${st.tableTranslatedCells} translated · ` +
+    `${st.tableNumericCells} numeric preserved` +
+    (render ? ` · ${written} written · ${overflow.length} overflow → English` : '') +
+    (st.tableUnresolvedCount ? ` · ${st.tableUnresolvedCount} unresolved (kept in English)` : '');
+
+  const lines: string[] = [
+    `detected tables:           ${st.tableCount}`,
+    `detected cells:            ${st.tableCellCount}`,
+    `translated cells:          ${st.tableTranslatedCells}  (translation units; the rest need no API call)`,
+    `numeric preserved cells:   ${st.tableNumericCells}`,
+    `unresolved tables:         ${st.tableUnresolvedCount}  (cell clustering failed; blocks kept in English)`,
+    render ? `cells written:             ${written}` : 'cells written:             — (generate a PDF)',
+    render ? `overflow cells:            ${overflow.length}` : 'overflow cells:            —',
+    render ? `fallback-to-English cells: ${overflow.length}` : 'fallback-to-English cells: —',
+    '',
+    'tables:',
+  ];
+  for (const t of layout.tables) {
+    lines.push(
+      t.resolved
+        ? `  page ${t.page}  table ${t.tableId}  rows ${t.rows}  columns ${t.columns}  cells ${t.cells}  translated ${t.translatedCells}  numeric ${t.numericCells}  header ${t.headerCells}`
+        : `  page ${t.page}  table ${t.tableId}  UNRESOLVED (${t.reason}) — blocks kept in English`,
+    );
+  }
+  if (overflow.length) {
+    lines.push('', 'overflow cells (TABLE_CELL_OVERFLOW, English kept):');
+    for (const r of overflow) {
+      const c = r.cell;
+      if (!c) continue;
+      lines.push(
+        `  page ${r.page}  table ${c.tableId}  row ${c.row}  column ${c.column}  final font ${c.finalFontSize} pt  reason ${c.overflowReason}\n    source: ${c.sourceText}`,
+      );
+    }
+  }
+  if (tableDiagnosticsCells.checked) {
+    lines.push('', 'cells:');
+    const box = (r: { x: number; y: number; width: number; height: number }) => `[${r.x}, ${r.y}, ${r.width}×${r.height}]`;
+    for (const b of layout.blocks) {
+      const c = b.cell;
+      if (!c) continue;
+      const final = cellReports.find((r) => r.sourceBlockIds[0] === b.id)?.cell?.finalFontSize;
+      const span = c.colSpan > 1 ? `–${c.columnIndex + c.colSpan - 1}` : '';
+      lines.push(
+        `  ${c.id}  page ${c.page}  table ${c.tableId}  r${c.rowIndex} c${c.columnIndex}${span}  ${c.alignment}  ` +
+          `${c.numeric ? 'numeric' : c.header ? 'header' : 'text'}  font ${c.fontSize}${final !== undefined ? ` → ${final}` : ''} pt  ` +
+          `bbox ${box(c.textBox)}  usable ${box(c.usable)}${c.trailingMarker ? `  marker ${c.trailingMarker}` : ''}${c.background ? `  bg ${c.background}` : ''}` +
+          `  ${JSON.stringify(b.text.slice(0, 60))}`,
+      );
+    }
+  }
+  tableDiagnosticsList.textContent = lines.join('\n');
+  tableDiagnostics.hidden = false;
+}
+
+tableDiagnosticsCells.addEventListener('change', () => {
+  if (currentLayout) renderTableDiagnostics(currentLayout, lastRenderResult);
+});
+
 function renderResults(analysis: PdfAnalysis, layout: LayoutResult | null): void {
   resFile.textContent = analysis.fileName;
   resPages.textContent = String(analysis.pageCount);
@@ -634,6 +723,7 @@ function renderResults(analysis: PdfAnalysis, layout: LayoutResult | null): void
     `${st.contextUnitCount} unit(s) (incomplete / merged / continuation only) · ${st.contextCharsSaved.toLocaleString()} context chars saved vs. sending 300 chars both ways for every unit`;
   debugLimitEl.textContent = String(Math.min(DEBUG_ITEM_LIMIT, analysis.textItemCount));
   toolbar.hidden = false;
+  renderTableDiagnostics(layout, null);
 
   if (layout.stats.translationBlockCount > 0) {
     testSection.hidden = false;
@@ -774,30 +864,126 @@ clearSelectionBtn.addEventListener('click', () => {
 // Translation Test Mode
 // ---------------------------------------------------------------------------
 
-type TranslateAllOptions = Omit<TranslateBlocksOptions, 'client' | 'cache' | 'targetLanguage'>;
+type TranslateAllOptions = Omit<DocumentTranslationOptions, 'client' | 'cache' | 'targetLanguage'>;
 
-/** Shared core: the translation pipeline (cache, batches, context, retries) for any set of units. */
+/**
+ * Shared core: terminology extraction → translation (cache, batches, context,
+ * retries, protected entities, post-checks) → QA of high-risk blocks, for any set of units.
+ */
 async function translateAll(
   blocks: TranslationBlock[],
   into: Map<string, TranslationEntry>,
   options: TranslateAllOptions,
 ): Promise<TranslationStats> {
-  const stats = await translateBlocks(blocks, into, {
+  const result = await translateDocument(blocks, into, {
     client,
     cache,
     targetLanguage: TARGET_LANGUAGE,
     documentOrder: currentLayout?.translationBlocks,
+    documentBlocks: currentLayout?.translationBlocks ?? blocks,
     ...options,
   });
-  const w = window as unknown as { __translations: Record<string, TranslationEntry>; __translationStats: TranslationStats };
+  const w = window as unknown as {
+    __translations: Record<string, TranslationEntry>;
+    __translationStats: TranslationStats;
+    __qualityStats: Omit<DocumentTranslationResult, 'translation' | 'terms'>;
+    __documentTerminology: DocumentTranslationResult['terms'];
+  };
   w.__translations = Object.fromEntries(into);
-  w.__translationStats = stats;
-  renderCostStats(stats);
-  return stats;
+  w.__translationStats = result.translation;
+  const { translation: _translation, terms, ...quality } = result;
+  w.__qualityStats = quality;
+  w.__documentTerminology = terms;
+  renderCostStats(result);
+  renderTerminologyPanel(result);
+  renderQaPanel(result, blocks, into);
+  return result.translation;
+}
+
+/** Developer Mode: the document glossary (user entries first, then automatic ones). */
+function renderTerminologyPanel(r: DocumentTranslationResult): void {
+  const t = r.terminology;
+  terminologySummary.textContent =
+    `Terminology: ${t.autoTerms} auto term(s), ${t.userTerms} user term(s)` +
+    (t.cached ? ' (auto terms reused from this session)' : t.requests ? ` (1 extraction request, ${t.samples} excerpts / ${t.sampleChars.toLocaleString()} chars)` : '');
+  const lines = r.terms.map((e) => `${e.source} → ${e.target}${e.abbreviation ? ` (${e.abbreviation})` : ''}  [${e.origin}]`);
+  if (t.warnings.length) lines.push('', ...t.warnings.map((w) => `warning: ${w}`));
+  terminologyList.textContent = lines.join('\n') || 'none';
+  terminologyPanel.hidden = false;
+}
+
+/** Developer Mode: high-risk blocks, QA results and the automatic warnings. */
+function renderQaPanel(r: DocumentTranslationResult, blocks: TranslationBlock[], into: Map<string, TranslationEntry>): void {
+  const s = r.translation;
+  const q = r.qa;
+  const translated = s.translatedBlocks + s.cachedBlocks;
+  const p = r.qaPolicy;
+  const pct = translated > 0 ? Math.round((q.blocksSent / translated) * 100) : 0;
+  qaSummary.textContent = `Quality Assurance: ${r.highRiskBlocks} hard-risk · ${r.softRiskBlocks} soft-risk · ${q.blocksChecked} QA checked · ${q.correctedBlocks} corrected (${pct}% of blocks sent to QA)`;
+  const lines = [
+    `hard-risk blocks:       ${r.highRiskBlocks} of ${translated} translated (QA candidates)`,
+    `soft-risk blocks:       ${r.softRiskBlocks} (weighting signals only, not sent to QA)`,
+    `QA checked:             ${q.blocksChecked} (sent ${q.blocksSent}, ${q.requests} request(s), ${q.failedBlocks} unanswered)`,
+    `QA corrected:           ${q.correctedBlocks}${q.rejectedCorrections ? ` (${q.rejectedCorrections} correction(s) rejected by the sanity check)` : ''}`,
+    `correction rate:        ${correctionRate(q)}`,
+    '',
+    'QA avoided (policy):',
+    `  soft-risk skipped by policy:  ${p.softRiskSkipped}`,
+    `  hard-risk checked:            ${p.hardRiskChecked}`,
+    `  critical mismatch forced QA:  ${p.criticalForced}`,
+    `  budget-skipped hard-risk:     ${p.budgetSkippedHardRisk}  (budget ${p.budget} block(s))`,
+    '',
+    `numeric warnings:       ${s.numericWarnings}`,
+    `citation warnings:      ${s.citationWarnings}`,
+    `placeholder warnings:   ${s.placeholderWarnings}  (protected entities: ${s.protectedEntities})`,
+  ];
+  for (const w of r.warnings) lines.push(`warning: ${w}`);
+  const flagged = blocks.filter((b) => (into.get(b.id)?.quality?.riskLevel ?? 'none') !== 'none');
+  if (flagged.length) {
+    lines.push('', 'risk-flagged blocks (hard = QA candidate, soft = reported only):');
+    for (const b of flagged) {
+      const e = into.get(b.id);
+      const qm = e?.quality;
+      if (!qm) continue;
+      const detail: string[] = [];
+      if (qm.numericMissing.length) detail.push(`numbers missing ${qm.numericMissing.join(' ')}`);
+      if (qm.numericAdded.length) detail.push(`numbers added ${qm.numericAdded.join(' ')}`);
+      if (qm.citationMissing.length) detail.push(`citations missing ${qm.citationMissing.join(' ')}`);
+      if (qm.placeholderMissing.length) detail.push(`placeholders lost ${qm.placeholderMissing.join(' ')}`);
+      const triggers = qm.qaTriggers.length ? `  triggers [${qm.qaTriggers.join(', ')}]` : '';
+      lines.push(
+        `  ${b.id}  p.${b.page}  ${qm.riskLevel}  score ${qm.riskScore}${triggers}  signals [${qm.riskReasons.join(', ')}]  QA: ${qm.qa}${qm.qaIssues.length ? ` (${qm.qaIssues.join(', ')})` : ''}${detail.length ? `  ${detail.join('; ')}` : ''}`,
+      );
+    }
+  }
+  qaList.textContent = lines.join('\n');
+  qaPanel.hidden = false;
+}
+
+function usageSummary(u: WorkerUsage | null | undefined): string {
+  if (!u) return 'usage not reported';
+  return `input ${u.inputTokens.toLocaleString()} · output ${u.outputTokens.toLocaleString()} · total ${(u.inputTokens + u.outputTokens).toLocaleString()}`;
+}
+
+function sumUsage(parts: (WorkerUsage | null | undefined)[]): WorkerUsage | null {
+  let sum: WorkerUsage | null = null;
+  for (const p of parts) {
+    if (!p) continue;
+    sum = sum ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+    sum.inputTokens += p.inputTokens;
+    sum.outputTokens += p.outputTokens;
+    sum.cachedInputTokens += p.cachedInputTokens;
+  }
+  return sum;
+}
+
+function correctionRate(q: { blocksChecked: number; correctedBlocks: number }): string {
+  return q.blocksChecked > 0 ? `${((q.correctedBlocks / q.blocksChecked) * 100).toFixed(1)}%` : 'n/a';
 }
 
 /** Developer Mode: requests, chars and tokens of the last translation run. */
-function renderCostStats(s: TranslationStats): void {
+function renderCostStats(r: DocumentTranslationResult): void {
+  const s = r.translation;
   const u = s.usage;
   const currentInput = u ? u.inputTokens : s.estimatedInputTokens;
   const saved = s.baselineEstimatedInputTokens - currentInput;
@@ -822,6 +1008,18 @@ function renderCostStats(s: TranslationStats): void {
     `Current:                      ${currentInput.toLocaleString()} input tokens (${u ? 'API usage' : 'estimate'}, ${s.requests} requests)`,
     `Saved:                        ${saved.toLocaleString()} tokens (${pct}%)`,
     `translation time:             ${(s.durationMs / 1000).toFixed(1)}s`,
+    '',
+    'Cost breakdown (API usage):',
+    `  First-pass:   ${s.requests} request(s) · ${usageSummary(u)}`,
+    `  Terminology:  ${r.terminology.requests} request(s)${r.terminology.cached ? ' (reused from session cache)' : ''} · ${usageSummary(r.terminology.usage)}`,
+    `  QA:           ${r.qa.requests} request(s) · ${usageSummary(r.qa.usage)}`,
+    `  Total:        ${s.requests + r.terminology.requests + r.qa.requests} request(s) · ${usageSummary(sumUsage([u, r.terminology.usage, r.qa.usage]))}`,
+    '',
+    'QA efficiency:',
+    `  QA checked:       ${r.qa.blocksChecked} of ${s.translatedBlocks} translated (${s.translatedBlocks ? Math.round((r.qa.blocksSent / s.translatedBlocks) * 100) : 0}% sent)`,
+    `  QA corrected:     ${r.qa.correctedBlocks}`,
+    `  Correction rate:  ${correctionRate(r.qa)}`,
+    `  QA time:          ${(r.qa.durationMs / 1000).toFixed(1)}s · terminology time: ${(r.terminology.durationMs / 1000).toFixed(1)}s`,
   ];
   costStatsList.textContent = lines.join('\n');
   costStats.hidden = false;
@@ -847,7 +1045,7 @@ async function runTest(): Promise<void> {
 
   try {
     await translateAll(blocks, entries, {
-      terminology,
+      userTerminology: terminology,
       maxBlocksPerBatch: TEST_MAX_BLOCKS,
       concurrency: 1,
       onProgress: (p) => setTestStatus(`${p.message}  (${p.blocksDone} / ${p.blocksTotal})`),
@@ -907,6 +1105,7 @@ function applyEntryToCard(card: HTMLElement | null, entry: TranslationEntry): vo
     status.textContent = entry.status;
     status.dataset.status = entry.status;
   }
+  applyQualityTag(card, entry);
   if (!translation) return;
   if (entry.status === 'done' || entry.status === 'cached') {
     translation.textContent = entry.translation ?? '';
@@ -919,6 +1118,27 @@ function applyEntryToCard(card: HTMLElement | null, entry: TranslationEntry): vo
     translation.textContent = entry.status === 'translating' ? 'Translating…' : 'Waiting…';
     translation.classList.add('muted');
   }
+}
+
+/** Risk / QA tag next to the status tag (Developer Mode cards). */
+function applyQualityTag(card: HTMLElement, entry: TranslationEntry): void {
+  const head = card.querySelector<HTMLElement>('.preview-head');
+  if (!head) return;
+  let tag = head.querySelector<HTMLElement>('.tag-qa');
+  const q = entry.quality;
+  if (!q || q.riskLevel === 'none') {
+    tag?.remove();
+    return;
+  }
+  if (!tag) {
+    tag = el('span', 'tag tag-qa');
+    head.appendChild(tag);
+  }
+  tag.textContent =
+    q.riskLevel === 'hard'
+      ? `hard-risk ${q.riskScore} [${q.qaTriggers.join(', ')}] · QA ${q.qa}${q.qaIssues.length ? `: ${q.qaIssues.join(', ')}` : ''}`
+      : `soft-risk ${q.riskScore}`;
+  tag.title = q.riskReasons.join(', ');
 }
 
 function updateTestEntry(entry: TranslationEntry): void {
@@ -949,7 +1169,7 @@ async function runTranslation(blocks: TranslationBlock[]): Promise<void> {
 
   try {
     await translateAll(blocks, entries, {
-      terminology,
+      userTerminology: terminology,
       onProgress: (p) => {
         setTranslateStatus(`${p.message}  (${p.blocksDone} / ${p.blocksTotal} blocks${p.blocksFailed ? `, ${p.blocksFailed} failed` : ''})`);
       },
@@ -1157,7 +1377,8 @@ function makeSkippedCard(block: TextBlock): HTMLElement {
 function updateBlockCardEntry(entry: TranslationEntry): void {
   const card = blocksList.querySelector<HTMLElement>(`[data-id="${entry.id}"]`);
   const translation = card?.querySelector<HTMLElement>('.translation');
-  if (!translation) return;
+  if (!card || !translation) return;
+  applyQualityTag(card, entry);
   if (entry.status === 'done' || entry.status === 'cached') {
     translation.textContent = entry.translation ?? '';
     translation.classList.remove('muted', 'error-text');
@@ -1427,6 +1648,10 @@ async function runGenerate(): Promise<void> {
     });
     const { result } = built;
     if (mode === 'overlay') setText(fontNote, built.fontNotes.length ? built.fontNotes.join('\n') : null);
+    if (mode === 'overlay') {
+      lastRenderResult = result;
+      renderTableDiagnostics(currentLayout, result);
+    }
 
     generatedUrl = built.url;
     downloadLink.href = generatedUrl;
@@ -1441,11 +1666,12 @@ async function runGenerate(): Promise<void> {
       renderStatus,
       mode === 'debug'
         ? `Debug PDF ready (${label}): ${s.pagesRendered} ${pagesWord} with bounding boxes in ${seconds}s. ` +
-            'Red = eligible block, blue = its lines, grey dashed = translated but not overlaid, green dashed = image' +
+            'Red = eligible block, blue = its lines, grey dashed = translated but not overlaid, green dashed = image, orange = table cell (dashed: usable area)' +
             (output === 'bilingual' ? '; boxes are drawn on the right half only.' : '.')
         : `Done (${label}, ${output === 'bilingual' ? 'side-by-side' : 'translated only'}) in ${seconds}s: ` +
             `${s.pagesRendered} ${pagesWord}, ${s.unitsWritten} unit(s) written, ${s.masksDrawn} lines masked, ` +
             `${s.unitsSkipped} unit(s) skipped, ${result.warnings.length} layout warning(s)` +
+            (s.tableCells ? `, table cells ${s.tableCellsWritten} written / ${s.tableCellsOverflow} kept in English` : '') +
             (s.replacedChars ? `, ${s.replacedChars} character(s) not in any font` : '') +
             `. Fonts: ${result.fonts}; fallback glyphs: ${s.fontFallbackCount}.`,
     );
@@ -1477,8 +1703,8 @@ exportMode.addEventListener('change', updateExportUi);
 // User Mode: automatic analyze → translate → side-by-side bilingual PDF
 // ---------------------------------------------------------------------------
 
-type JobStep = 'read' | 'analyze' | 'translate' | 'generate' | 'done';
-const JOB_STEPS: JobStep[] = ['read', 'analyze', 'translate', 'generate', 'done'];
+type JobStep = 'read' | 'analyze' | 'terminology' | 'translate' | 'qa' | 'generate' | 'done';
+const JOB_STEPS: JobStep[] = ['read', 'analyze', 'terminology', 'translate', 'qa', 'generate', 'done'];
 
 /** Failures a general user can act on; the message never contains technical details. */
 class UserFacingError extends Error {
@@ -1596,16 +1822,27 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
       throw new UserFacingError(MSG_UNSUPPORTED);
     }
 
-    // Translate every eligible unit (TITLE / HEADING / BODY / CAPTION / FOOTNOTE; references stay English).
+    // Terminology → translate every eligible unit (TITLE / HEADING / BODY / CAPTION / FOOTNOTE;
+    // references stay English) → QA of high-risk units. Terminology / QA problems never stop the job.
     step = 'translate';
-    setJobProgress('translate', 20, '正在翻譯...');
+    setJobProgress('terminology', 20, '正在分析專業術語...');
     void loadFontSet().catch(() => undefined); // warm the font download while translating
     const blocks = layout.translationBlocks;
     const stats = await translateAll(blocks, jobEntries, {
       signal: job.controller.signal,
+      onStage: (stage) => {
+        if (!alive()) return;
+        if (stage === 'terminology') setJobProgress('terminology', 20, '正在分析專業術語...');
+        else if (stage === 'translate') setJobProgress('translate', 24, '正在翻譯...');
+        else setJobProgress('qa', 74, '正在檢查翻譯品質...');
+      },
       onProgress: (p) => {
         if (!alive() || p.blocksTotal === 0) return;
-        setJobProgress('translate', 20 + (60 * (p.blocksDone + p.blocksFailed)) / p.blocksTotal, '正在翻譯...');
+        setJobProgress('translate', 24 + (50 * (p.blocksDone + p.blocksFailed)) / p.blocksTotal, '正在翻譯...');
+      },
+      onQaProgress: (done, total) => {
+        if (!alive() || total === 0) return;
+        setJobProgress('qa', 74 + (7 * done) / total, '正在檢查翻譯品質...');
       },
     });
     if (!alive()) return;
@@ -1618,7 +1855,7 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
     if (translated === 0) throw new UserFacingError(translateFailureMessage());
 
     step = 'generate';
-    setJobProgress('generate', 81, '正在產生中英對照 PDF...');
+    setJobProgress('generate', 82, '正在產生中英對照 PDF...');
     const built = await buildPdf({
       pdf: { ...pdf, layout },
       fileName: file.name,
@@ -1629,7 +1866,7 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
       unitIds: null,
       onStatus: () => undefined,
       onProgress: (p) => {
-        if (alive()) setJobProgress('generate', 83 + (16 * p.percent) / 100, '正在產生中英對照 PDF...');
+        if (alive()) setJobProgress('generate', 84 + (15 * p.percent) / 100, '正在產生中英對照 PDF...');
       },
     });
     if (!alive()) {

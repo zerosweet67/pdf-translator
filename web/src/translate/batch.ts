@@ -11,13 +11,22 @@
  * Token economy (see README §8):
  *  - blocks the classifier let through but that need no translation (numbers,
  *    DOI, URL, e-mail, citation marker) are marked `skipped` and never sent;
- *  - the cache is consulted per block with a whitespace-normalized key;
+ *  - the cache is consulted per block with a whitespace-normalized key plus
+ *    the hash of the glossary entries relevant to that block;
  *  - previous/next context is dropped whenever the neighbouring unit is in
  *    the same request: the model already sees it there in reading order, so
  *    the text would only be sent twice. Context survives only across batch
  *    boundaries and next to cached / skipped neighbours;
  *  - the payload carries id, text and (rarely) contextBefore / contextAfter /
- *    incompleteSource. Layout, fonts, pages and debug data stay in the browser.
+ *    incompleteSource / type. Layout, fonts, pages and debug data stay in the browser;
+ *  - a batch carries only the glossary entries that occur in its blocks.
+ *
+ * Academic fidelity (translate/protect.ts, entities.ts, risk.ts):
+ *  - citations, figure/table references, DOIs, URLs and e-mails are replaced
+ *    by placeholders before the request and restored afterwards;
+ *  - every translation is checked for lost placeholders, changed numbers /
+ *    statistics and changed citations, then scored; the result lives in
+ *    `entry.quality` and drives the second-pass QA (qa.ts).
  *
  * `TranslationStats` records requests, chars and tokens (estimated, plus the
  * provider's real usage when the Worker reports it) for Developer Mode.
@@ -25,9 +34,13 @@
 
 import { isUntranslatableText } from '../pdf/classify';
 import { isCjkChar } from '../pdf/fit';
-import type { TranslationBlock, TranslationEntry } from '../pdf/types';
+import type { BlockQuality, TranslationBlock, TranslationEntry } from '../pdf/types';
 import type { TranslationCache } from './cache';
 import { TranslateClient, TranslateClientError, type WorkerBlockInput, type WorkerUsage } from './client';
+import { compareNumeric } from './entities';
+import { compareCitations, protectText, restoreText, type ProtectedText } from './protect';
+import { assessRisk } from './risk';
+import { relevantTerms, terminologyHash, toWorkerTerminology, type TermEntry } from './terminology';
 
 export const DEFAULT_MAX_BLOCKS = 25;
 /** Text + context characters per request; the Worker accepts up to 40 000. */
@@ -37,7 +50,7 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const MISSING_RETRY_BATCH_SIZE = 5;
 
 /** Rough size of the Worker's system prompt after compression + a few matched glossary terms. */
-const PROMPT_TOKENS_ESTIMATE = 500;
+const PROMPT_TOKENS_ESTIMATE = 650;
 /** JSON keys, id and quotes per unit in the request and in the reply. */
 const PER_UNIT_OVERHEAD_TOKENS = 12;
 /**
@@ -49,6 +62,11 @@ const LEGACY_PROMPT_TOKENS = 1050;
 const LEGACY_MAX_BLOCKS = 15;
 const LEGACY_MAX_CHARS = 12_000;
 const LEGACY_CONTEXT_RATIO = 150 / 120;
+
+/** Block types that get a short guidance line in the Worker prompt; BODY is the default and is not sent. */
+const TYPED_BLOCKS = new Set(['TITLE', 'HEADING', 'CAPTION', 'FOOTNOTE', 'TABLE']);
+/** Table units are logical cells (pdf/table.ts): the Worker gets the cell-specific guidance. */
+const TABLE_CELL_TYPE = 'TABLE_CELL';
 
 /** Cheap token estimate: ~4 English characters or ~0.8 CJK character per token. */
 export function estimateTokens(text: string): number {
@@ -101,14 +119,28 @@ export interface TranslationStats {
   baselineEstimatedInputTokens: number;
   baselineRequests: number;
   durationMs: number;
+  /** Glossary entries sent, summed over requests (only the relevant ones per batch). */
+  terminologyEntriesSent: number;
+  /** Citations / references / DOIs / URLs / e-mails replaced by placeholders. */
+  protectedEntities: number;
+  /** Blocks with at least one placeholder that did not come back. */
+  placeholderWarnings: number;
+  /** Blocks whose numbers / statistics differ from the source. */
+  numericWarnings: number;
+  /** Blocks whose citations differ from the source. */
+  citationWarnings: number;
+  /** Blocks scored high-risk by the post-checks (QA candidates). */
+  highRiskBlocks: number;
 }
 
 export interface TranslateBlocksOptions {
   client: TranslateClient;
   cache: TranslationCache;
   targetLanguage: string;
-  /** Optional extra terminology sent with every batch, merged over the Worker defaults. */
-  terminology?: Record<string, string>;
+  /** Document glossary (user + auto); only the entries relevant to a batch are sent with it. */
+  terms?: readonly TermEntry[];
+  /** Placeholder protection of citations / references / DOIs / URLs (default true). */
+  protect?: boolean;
   maxBlocksPerBatch?: number;
   maxCharsPerBatch?: number;
   concurrency?: number;
@@ -151,19 +183,26 @@ export function makeBatches(blocks: TranslationBlock[], maxBlocks: number, maxCh
 /**
  * Request payload for one batch: id + text, plus context only when the
  * neighbour that context comes from is not part of this same request.
+ * `texts` (id → protected text) replaces the source text when given.
  */
-export function buildPayload(batch: TranslationBlock[], documentOrder?: readonly TranslationBlock[]): WorkerBlockInput[] {
+export function buildPayload(
+  batch: TranslationBlock[],
+  documentOrder?: readonly TranslationBlock[],
+  texts?: ReadonlyMap<string, string>,
+): WorkerBlockInput[] {
   const inBatch = new Set(batch.map((b) => b.id));
   const index = documentOrder ? new Map(documentOrder.map((u, i) => [u.id, i])) : null;
   const order = documentOrder ?? [];
   return batch.map((b) => {
-    const input: WorkerBlockInput = { id: b.id, text: b.text };
+    const input: WorkerBlockInput = { id: b.id, text: texts?.get(b.id) ?? b.text };
     const i = index?.get(b.id);
     const prevInBatch = i !== undefined && i > 0 && inBatch.has(order[i - 1].id);
     const nextInBatch = i !== undefined && i < order.length - 1 && inBatch.has(order[i + 1].id);
     if (b.previousContext && !prevInBatch) input.contextBefore = b.previousContext;
     if (b.nextContext && !nextInBatch) input.contextAfter = b.nextContext;
     if (b.incompleteSource) input.incompleteSource = true;
+    if (b.type === 'TABLE') input.type = TABLE_CELL_TYPE;
+    else if (TYPED_BLOCKS.has(b.type)) input.type = b.type;
     return input;
   });
 }
@@ -198,6 +237,46 @@ function cleanTranslation(text: string): string {
 }
 
 /**
+ * Post-translation checks of one block: placeholders, numbers, citations,
+ * risk score. Pure; used for fresh translations and for cache hits alike.
+ */
+export function assessTranslation(
+  block: TranslationBlock,
+  translation: string,
+  options: { terminologyHash: string; protectedEntities: number; placeholderMissing: string[] },
+): BlockQuality {
+  const numeric = compareNumeric(block.text, translation);
+  const citation = compareCitations(block.text, translation);
+  const risk = assessRisk({
+    source: block.text,
+    translation,
+    wasMerged: block.wasMerged,
+    crossPage: block.pages.length > 1,
+    incompleteSource: block.incompleteSource,
+    numeric,
+    citation,
+    placeholderMissing: options.placeholderMissing.length,
+  });
+  return {
+    terminologyHash: options.terminologyHash,
+    protectedEntities: options.protectedEntities,
+    placeholderMissing: options.placeholderMissing,
+    numericMissing: numeric.missing,
+    numericAdded: numeric.added,
+    citationMissing: citation.missing,
+    citationAdded: citation.added,
+    riskScore: risk.score,
+    riskReasons: risk.reasons,
+    riskLevel: risk.level,
+    qaTriggers: risk.triggers,
+    highRisk: risk.high,
+    qa: 'none',
+    qaIssues: [],
+    originalTranslation: null,
+  };
+}
+
+/**
  * Translate `blocks`, writing results into `entries` (keyed by block id).
  * Existing entries are overwritten; blocks already in the cache are not sent.
  */
@@ -210,7 +289,8 @@ export async function translateBlocks(
     client,
     cache,
     targetLanguage,
-    terminology = {},
+    terms = [],
+    protect = true,
     maxBlocksPerBatch = DEFAULT_MAX_BLOCKS,
     maxCharsPerBatch = DEFAULT_MAX_CHARS,
     concurrency = DEFAULT_CONCURRENCY,
@@ -251,6 +331,12 @@ export async function translateBlocks(
     baselineEstimatedInputTokens: 0,
     baselineRequests: 0,
     durationMs: 0,
+    terminologyEntriesSent: 0,
+    protectedEntities: 0,
+    placeholderWarnings: 0,
+    numericWarnings: 0,
+    citationWarnings: 0,
+    highRiskBlocks: 0,
   };
   const finish = (): TranslationStats => {
     stats.failedBlocks = progress.blocksFailed;
@@ -269,24 +355,47 @@ export async function translateBlocks(
     onEntry?.(next);
   };
 
+  const countWarnings = (q: BlockQuality) => {
+    if (q.placeholderMissing.length) stats.placeholderWarnings++;
+    if (q.numericMissing.length || q.numericAdded.length) stats.numericWarnings++;
+    if (q.citationMissing.length || q.citationAdded.length) stats.citationWarnings++;
+    if (q.highRisk) stats.highRiskBlocks++;
+  };
+
   report();
+
+  // Per-block glossary relevance (cache key + batch glossary) and placeholder protection.
+  const relevantById = new Map<string, TermEntry[]>();
+  const hashById = new Map<string, string>();
+  const protectedById = new Map<string, ProtectedText>();
+  const protectedTexts = new Map<string, string>();
 
   // 1. skip what needs no API call, then cache lookup
   const pending: TranslationBlock[] = [];
   for (const block of blocks) {
     if (isUntranslatableText(block.text)) {
-      update(block.id, { status: 'skipped', translation: null, error: null });
+      update(block.id, { status: 'skipped', translation: null, error: null, quality: undefined });
       stats.skippedBlocks++;
       progress.blocksDone++;
       continue;
     }
-    const cached = cache.get(block.text, targetLanguage);
+    const relevant = relevantTerms(terms, block.text);
+    const hash = terminologyHash(relevant);
+    relevantById.set(block.id, relevant);
+    hashById.set(block.id, hash);
+    const cached = cache.get(block.text, targetLanguage, hash);
     if (cached !== undefined) {
-      update(block.id, { status: 'cached', translation: cached, error: null });
+      const quality = assessTranslation(block, cached, { terminologyHash: hash, protectedEntities: 0, placeholderMissing: [] });
+      countWarnings(quality);
+      update(block.id, { status: 'cached', translation: cached, error: null, quality });
       stats.cachedBlocks++;
       progress.blocksDone++;
     } else {
-      update(block.id, { status: 'pending', translation: null, error: null });
+      const p = protect ? protectText(block.text) : { text: block.text, placeholders: [] };
+      protectedById.set(block.id, p);
+      protectedTexts.set(block.id, p.text);
+      stats.protectedEntities += p.placeholders.length;
+      update(block.id, { status: 'pending', translation: null, error: null, quality: undefined });
       pending.push(block);
     }
   }
@@ -336,24 +445,42 @@ export async function translateBlocks(
     }
   };
 
+  /** Glossary for one batch: the union of the entries relevant to its blocks. */
+  const batchTerminology = (batch: TranslationBlock[]): Record<string, string> => {
+    const seen = new Map<string, TermEntry>();
+    for (const b of batch) for (const t of relevantById.get(b.id) ?? []) seen.set(t.source.toLowerCase(), t);
+    return toWorkerTerminology([...seen.values()]);
+  };
+
   const runBatch = async (batch: TranslationBlock[], label: string, retryPass: boolean): Promise<void> => {
     for (const b of batch) update(b.id, { status: 'translating' });
-    const payload = buildPayload(batch, documentOrder);
+    const payload = buildPayload(batch, documentOrder, protectedTexts);
+    const terminology = batchTerminology(batch);
 
     let attempt = 0;
     while (true) {
       attempt++;
       try {
         const response = await client.translate(payload, targetLanguage, terminology);
+        stats.terminologyEntriesSent += Object.keys(terminology).length;
         const got = new Map(response.blocks.map((b) => [b.id, b.translation]));
         const translations: string[] = [];
         for (const b of batch) {
-          const translation = got.get(b.id);
-          if (translation !== undefined && translation.trim().length > 0) {
-            const clean = cleanTranslation(translation);
+          const raw = got.get(b.id);
+          if (raw !== undefined && raw.trim().length > 0) {
+            const p = protectedById.get(b.id) ?? { text: b.text, placeholders: [] };
+            const restored = restoreText(raw, p.placeholders);
+            const clean = cleanTranslation(restored.text);
+            const hash = hashById.get(b.id) ?? '';
+            const quality = assessTranslation(b, clean, {
+              terminologyHash: hash,
+              protectedEntities: p.placeholders.length,
+              placeholderMissing: [...restored.missing.map((m) => m.token), ...restored.leftover],
+            });
+            countWarnings(quality);
             translations.push(clean);
-            cache.set(b.text, targetLanguage, clean);
-            update(b.id, { status: 'done', translation: clean, error: null });
+            cache.set(b.text, targetLanguage, clean, hash);
+            update(b.id, { status: 'done', translation: clean, error: null, quality });
             stats.translatedBlocks++;
             progress.blocksDone++;
           } else {
@@ -428,6 +555,8 @@ export async function translateBlocks(
       `inputChars=${s.inputChars} contextChars=${s.contextChars}/${s.contextCharsAssigned} ` +
       `estIn=${s.estimatedInputTokens} estOut=${s.estimatedOutputTokens} ` +
       (s.usage ? `usageIn=${s.usage.inputTokens} usageCached=${s.usage.cachedInputTokens} usageOut=${s.usage.outputTokens} ` : '') +
+      `terms=${s.terminologyEntriesSent} protected=${s.protectedEntities} placeholderWarn=${s.placeholderWarnings} ` +
+      `numericWarn=${s.numericWarnings} citationWarn=${s.citationWarnings} highRisk=${s.highRiskBlocks} ` +
       `baselineIn=${s.baselineEstimatedInputTokens} (${s.baselineRequests} req) ${(s.durationMs / 1000).toFixed(1)}s`,
   );
   return s;

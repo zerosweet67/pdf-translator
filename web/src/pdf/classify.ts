@@ -319,7 +319,7 @@ export function isNumericOnly(text: string): boolean {
 }
 
 /** Upper-case abbreviations only ("COPD", "LABA + ICS", "FEV1/FVC"): the translation would return them unchanged. */
-function isAbbreviationOnly(text: string): boolean {
+export function isAbbreviationOnly(text: string): boolean {
   const t = text.trim();
   return t.length <= 24 && /^[A-Z][A-Z0-9₀-₉²³.\s+/&-]*$/.test(t) && /[A-Z]{2}/.test(t);
 }
@@ -447,6 +447,7 @@ function classifySection(b: TextBlock, state: SectionState, m: BlockMetrics, tab
     } else {
       table.lastPage = b.page;
       b.type = 'TABLE';
+      b.tableId = table.id;
       if (isNumericOnly(text)) {
         b.blockType = 'TABLE_CELL';
         b.skipReason = 'NUMERIC_ONLY';

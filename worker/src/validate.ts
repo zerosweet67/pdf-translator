@@ -1,5 +1,5 @@
 /**
- * Request validation for POST /translate.
+ * Request validation for POST /translate, POST /terminology and POST /qa.
  * Limits keep a single request small enough for one provider call.
  */
 
@@ -11,9 +11,19 @@ export const LIMITS = {
   maxIdLength: 96,
   maxTerminologyEntries: 200,
   maxTermLength: 120,
+  /** POST /terminology: excerpts per request and characters per excerpt / in total. */
+  maxSamples: 40,
+  maxSampleChars: 2000,
+  maxSampleTotalChars: 16_000,
+  /** POST /qa: blocks per request, characters (source + translation) in total, warning codes per block. */
+  maxQaBlocks: 20,
+  maxQaTotalChars: 60_000,
+  maxQaIssues: 12,
 } as const;
 
 const TARGET_LANGUAGES = new Set(['zh-TW']);
+const BLOCK_TYPE_RE = /^[A-Z_]{1,24}$/;
+const ISSUE_CODE_RE = /^[A-Z_]{1,40}$/;
 
 export class ValidationError extends Error {
   constructor(message: string) {
@@ -31,12 +41,33 @@ export interface RequestBlock {
   contextAfter?: string;
   /** Source looks cut off; the model must not invent the missing part. */
   incompleteSource?: boolean;
+  /** Block type for the short per-type guidance (TITLE, HEADING, CAPTION, ...). */
+  type?: string;
 }
 
 export interface TranslateRequest {
   blocks: RequestBlock[];
   targetLanguage: string;
   /** Optional extra terminology, merged over the Worker's defaults. */
+  terminology: Record<string, string>;
+}
+
+export interface TerminologyRequest {
+  samples: string[];
+  targetLanguage: string;
+}
+
+export interface QaRequestBlock {
+  id: string;
+  source: string;
+  translation: string;
+  type?: string;
+  issues?: string[];
+}
+
+export interface QaRequest {
+  blocks: QaRequestBlock[];
+  targetLanguage: string;
   terminology: Record<string, string>;
 }
 
@@ -74,17 +105,36 @@ function optionalContext(value: unknown, label: string): string | undefined {
   return t;
 }
 
-export function validateTranslateRequest(body: unknown): TranslateRequest {
-  if (!body || typeof body !== 'object') throw new ValidationError('Body must be a JSON object.');
-  const { blocks, targetLanguage, terminology } = body as {
-    blocks?: unknown;
-    targetLanguage?: unknown;
-    terminology?: unknown;
-  };
+function optionalType(value: unknown, label: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string' || !BLOCK_TYPE_RE.test(value)) {
+    throw new ValidationError(`${label} must be an upper-case block type.`);
+  }
+  return value;
+}
 
+function targetLanguageOf(body: { targetLanguage?: unknown }): string {
+  const { targetLanguage } = body;
   if (typeof targetLanguage !== 'string' || !TARGET_LANGUAGES.has(targetLanguage)) {
     throw new ValidationError(`targetLanguage must be one of: ${[...TARGET_LANGUAGES].join(', ')}.`);
   }
+  return targetLanguage;
+}
+
+function validId(id: unknown, i: number, seen: Set<string>): string {
+  if (typeof id !== 'string' || id.length === 0 || id.length > LIMITS.maxIdLength) {
+    throw new ValidationError(`blocks[${i}].id must be a string of 1-${LIMITS.maxIdLength} characters.`);
+  }
+  if (seen.has(id)) throw new ValidationError(`Duplicate block id "${id}".`);
+  seen.add(id);
+  return id;
+}
+
+export function validateTranslateRequest(body: unknown): TranslateRequest {
+  if (!body || typeof body !== 'object') throw new ValidationError('Body must be a JSON object.');
+  const { blocks, terminology } = body as { blocks?: unknown; terminology?: unknown };
+  const targetLanguage = targetLanguageOf(body as { targetLanguage?: unknown });
+
   if (!Array.isArray(blocks) || blocks.length === 0) {
     throw new ValidationError('blocks must be a non-empty array.');
   }
@@ -98,17 +148,15 @@ export function validateTranslateRequest(body: unknown): TranslateRequest {
 
   for (const [i, raw] of blocks.entries()) {
     if (!raw || typeof raw !== 'object') throw new ValidationError(`blocks[${i}] must be an object.`);
-    const { id, text, contextBefore, contextAfter, incompleteSource } = raw as {
+    const { id, text, contextBefore, contextAfter, incompleteSource, type } = raw as {
       id?: unknown;
       text?: unknown;
       contextBefore?: unknown;
       contextAfter?: unknown;
       incompleteSource?: unknown;
+      type?: unknown;
     };
-    if (typeof id !== 'string' || id.length === 0 || id.length > LIMITS.maxIdLength) {
-      throw new ValidationError(`blocks[${i}].id must be a string of 1-${LIMITS.maxIdLength} characters.`);
-    }
-    if (seen.has(id)) throw new ValidationError(`Duplicate block id "${id}".`);
+    const validatedId = validId(id, i, seen);
     if (typeof text !== 'string' || text.trim().length === 0) {
       throw new ValidationError(`blocks[${i}].text must be a non-empty string.`);
     }
@@ -122,15 +170,95 @@ export function validateTranslateRequest(body: unknown): TranslateRequest {
     if (incompleteSource !== undefined && typeof incompleteSource !== 'boolean') {
       throw new ValidationError(`blocks[${i}].incompleteSource must be a boolean.`);
     }
-    seen.add(id);
     out.push({
-      id,
+      id: validatedId,
       text,
       contextBefore: optionalContext(contextBefore, `blocks[${i}].contextBefore`),
       contextAfter: optionalContext(contextAfter, `blocks[${i}].contextAfter`),
       incompleteSource: incompleteSource === true ? true : undefined,
+      type: optionalType(type, `blocks[${i}].type`),
     });
   }
 
+  return { blocks: out, targetLanguage, terminology: validateTerminology(terminology) };
+}
+
+/** POST /terminology: { samples: string[], targetLanguage }. */
+export function validateTerminologyRequest(body: unknown): TerminologyRequest {
+  if (!body || typeof body !== 'object') throw new ValidationError('Body must be a JSON object.');
+  const { samples } = body as { samples?: unknown };
+  const targetLanguage = targetLanguageOf(body as { targetLanguage?: unknown });
+  if (!Array.isArray(samples) || samples.length === 0) throw new ValidationError('samples must be a non-empty array of strings.');
+  if (samples.length > LIMITS.maxSamples) throw new ValidationError(`Too many samples: ${samples.length} > ${LIMITS.maxSamples}.`);
+  const out: string[] = [];
+  let total = 0;
+  for (const [i, raw] of samples.entries()) {
+    if (typeof raw !== 'string') throw new ValidationError(`samples[${i}] must be a string.`);
+    const t = raw.trim();
+    if (!t) continue;
+    if (t.length > LIMITS.maxSampleChars) throw new ValidationError(`samples[${i}] exceeds ${LIMITS.maxSampleChars} characters.`);
+    total += t.length;
+    if (total > LIMITS.maxSampleTotalChars) throw new ValidationError(`Total sample text exceeds ${LIMITS.maxSampleTotalChars} characters.`);
+    out.push(t);
+  }
+  if (out.length === 0) throw new ValidationError('samples must contain text.');
+  return { samples: out, targetLanguage };
+}
+
+/** POST /qa: { blocks: [{id, source, translation, type?, issues?}], targetLanguage, terminology? }. */
+export function validateQaRequest(body: unknown): QaRequest {
+  if (!body || typeof body !== 'object') throw new ValidationError('Body must be a JSON object.');
+  const { blocks, terminology } = body as { blocks?: unknown; terminology?: unknown };
+  const targetLanguage = targetLanguageOf(body as { targetLanguage?: unknown });
+  if (!Array.isArray(blocks) || blocks.length === 0) throw new ValidationError('blocks must be a non-empty array.');
+  if (blocks.length > LIMITS.maxQaBlocks) throw new ValidationError(`Too many blocks: ${blocks.length} > ${LIMITS.maxQaBlocks}.`);
+
+  const seen = new Set<string>();
+  const out: QaRequestBlock[] = [];
+  let total = 0;
+  for (const [i, raw] of blocks.entries()) {
+    if (!raw || typeof raw !== 'object') throw new ValidationError(`blocks[${i}] must be an object.`);
+    const { id, source, translation, type, issues } = raw as {
+      id?: unknown;
+      source?: unknown;
+      translation?: unknown;
+      type?: unknown;
+      issues?: unknown;
+    };
+    const validatedId = validId(id, i, seen);
+    for (const [label, value] of [
+      ['source', source],
+      ['translation', translation],
+    ] as const) {
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new ValidationError(`blocks[${i}].${label} must be a non-empty string.`);
+      }
+      if (value.length > LIMITS.maxBlockChars) {
+        throw new ValidationError(`blocks[${i}].${label} exceeds ${LIMITS.maxBlockChars} characters.`);
+      }
+      total += value.length;
+    }
+    if (total > LIMITS.maxQaTotalChars) {
+      throw new ValidationError(`Total text exceeds ${LIMITS.maxQaTotalChars} characters. Send smaller batches.`);
+    }
+    let codes: string[] | undefined;
+    if (issues !== undefined && issues !== null) {
+      if (!Array.isArray(issues) || issues.length > LIMITS.maxQaIssues) {
+        throw new ValidationError(`blocks[${i}].issues must be an array of at most ${LIMITS.maxQaIssues} codes.`);
+      }
+      codes = [];
+      for (const code of issues) {
+        if (typeof code !== 'string' || !ISSUE_CODE_RE.test(code)) throw new ValidationError(`blocks[${i}].issues must contain upper-case codes.`);
+        codes.push(code);
+      }
+    }
+    out.push({
+      id: validatedId,
+      source: source as string,
+      translation: translation as string,
+      type: optionalType(type, `blocks[${i}].type`),
+      issues: codes && codes.length ? codes : undefined,
+    });
+  }
   return { blocks: out, targetLanguage, terminology: validateTerminology(terminology) };
 }

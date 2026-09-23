@@ -47,6 +47,31 @@ export interface ImageBox {
   height: number;
 }
 
+/**
+ * A thin straight vector line (stroked path or thin filled rectangle) on a
+ * page, PDF user space. Table rules are the main use; `x1 - x0` or `y1 - y0`
+ * is (almost) zero depending on the orientation.
+ */
+export interface RuleLine {
+  orientation: 'horizontal' | 'vertical';
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** Stroke width or rectangle thickness (points). */
+  thickness: number;
+}
+
+/** A filled rectangle (row shading, header background), PDF user space. */
+export interface FilledRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** CSS hex colour as PDF.js reports it ("#f4f3ec"), null when unknown. */
+  color: string | null;
+}
+
 /** Per-page geometry, needed later when converting coordinate systems. */
 export interface PageDebugInfo {
   pageNumber: number;
@@ -65,6 +90,13 @@ export interface PageDebugInfo {
    * operator list. Vector drawings are not included. Empty when detection failed.
    */
   images: ImageBox[];
+  /**
+   * Horizontal / vertical rules (table borders, separators) from the operator
+   * list. Empty when detection failed or the page has none.
+   */
+  rules: RuleLine[];
+  /** Filled rectangles that may be table backgrounds (light colours only). */
+  fills: FilledRect[];
 }
 
 /** Result of analysing one PDF file. */
@@ -207,6 +239,75 @@ export interface TextBlock {
   translate: boolean;
   /** Why the block is not translated, null when translate is true. */
   skipReason: string | null;
+  /** Table this block belongs to (per document, from the table caption), TABLE blocks only. */
+  tableId?: number;
+  /**
+   * Set when the block is one logical table cell (pdf/table.ts): the cell's
+   * usable rectangle, position and alignment. Such a block is masked, fitted
+   * and drawn by the table-only path of the renderer.
+   */
+  cell?: TableCellInfo;
+}
+
+/** Horizontal alignment of a table cell, taken from its column. */
+export type CellAlignment = 'left' | 'center' | 'right';
+
+/** Axis-aligned rectangle in PDF user space (bottom-left origin). */
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * One logical table cell: every text item, line and footnote marker of that
+ * cell merged into one translation unit (pdf/table.ts).
+ */
+export interface TableCellInfo {
+  /** "p{page}-t{tableId}-r{row}c{col}". */
+  id: string;
+  page: number;
+  tableId: number;
+  rowIndex: number;
+  columnIndex: number;
+  /** Number of columns the cell spans (1 for an ordinary cell). */
+  colSpan: number;
+  /** Index of every source text item (position in PdfAnalysis.items) of this cell. */
+  sourceItemIds: number[];
+  /** Tight union of the source glyph boxes. */
+  textBox: Rect;
+  /**
+   * Rectangle the translation may occupy: inside the row / column band,
+   * clear of table rules and neighbouring cells, with a small padding.
+   */
+  usable: Rect;
+  alignment: CellAlignment;
+  fontSize: number;
+  /** Cell text only: numbers, statistics, dashes. Never translated. */
+  numeric: boolean;
+  /** Column header (above the first data row). */
+  header: boolean;
+  /** Superscript footnote marker at the end of the cell ("d" of "Medicaid^d"), drawn back after the translation. */
+  trailingMarker: string | null;
+  /** Fill colour behind the cell ("#f4f3ec"), null for plain paper. */
+  background: string | null;
+}
+
+/** Table diagnostics for Developer Mode (one entry per detected table). */
+export interface TableSummary {
+  page: number;
+  tableId: number;
+  /** False when cell clustering failed; the table's blocks then stay in English. */
+  resolved: boolean;
+  rows: number;
+  columns: number;
+  cells: number;
+  translatedCells: number;
+  numericCells: number;
+  headerCells: number;
+  /** Why clustering failed, null when resolved. */
+  reason: string | null;
 }
 
 export interface PageLayout {
@@ -229,6 +330,8 @@ export interface LayoutResult {
   blocks: TextBlock[];
   /** The subset that will be translated, in reading order. */
   translationBlocks: TranslationBlock[];
+  /** Detected tables (from table captions) and how their cells were resolved. */
+  tables: TableSummary[];
   stats: {
     lineCount: number;
     blockCount: number;
@@ -247,6 +350,15 @@ export interface LayoutResult {
     contextUnitCount: number;
     /** Context characters the old "300 chars both sides for every unit" policy would have sent, minus contextChars. */
     contextCharsSaved: number;
+    /** Tables detected from captions. */
+    tableCount: number;
+    /** Logical cells over all resolved tables. */
+    tableCellCount: number;
+    tableTranslatedCells: number;
+    /** Numeric cells kept as they are (no API call). */
+    tableNumericCells: number;
+    /** Tables whose cells could not be resolved (kept in English). */
+    tableUnresolvedCount: number;
   };
 }
 
@@ -297,9 +409,79 @@ export interface TranslationBlock {
 /** `skipped`: needs no translation (number, DOI, URL, ...); kept as it is and never sent. */
 export type TranslationStatus = 'pending' | 'translating' | 'done' | 'cached' | 'skipped' | 'failed';
 
+/**
+ * QA triggers (translate/risk.ts), in priority order. The first three are
+ * critical: they always go to QA, even beyond the QA budget.
+ */
+export type QaTrigger =
+  | 'PLACEHOLDER_ERROR'
+  | 'NUMERIC_MISMATCH'
+  | 'CITATION_MISMATCH'
+  | 'SYMBOL_MISMATCH'
+  | 'NEGATION_WITH_OUTCOME'
+  | 'UNCERTAINTY_WITH_OUTCOME'
+  | 'CROSS_PAGE_INCOMPLETE'
+  | 'MERGED_INCOMPLETE_SEMANTIC'
+  | 'HIGH_RISK_SCORE';
+
+/** hard: a QA candidate (a trigger fired); soft: weighting signals only, never sent to QA on their own. */
+export type RiskLevel = 'none' | 'soft' | 'hard';
+
+/** Risk signals of a block (translate/risk.ts); hard or soft depending on the combination. */
+export type RiskReason =
+  | 'NUMERIC_MISMATCH'
+  | 'CITATION_MISMATCH'
+  | 'PLACEHOLDER_ERROR'
+  | 'MERGED_BLOCK'
+  | 'CROSS_PAGE_BLOCK'
+  | 'INCOMPLETE_SOURCE'
+  | 'LENGTH_ANOMALY'
+  | 'SYMBOL_MISSING'
+  | 'NEGATION'
+  | 'UNCERTAINTY'
+  | 'DENSE_NOTATION';
+
+/**
+ * Second-pass QA state of a block:
+ *  none      – not a QA candidate (no risk, or soft risk only), never sent
+ *  skipped   – hard-risk but over the QA budget (cost cap)
+ *  pending   – selected, request in flight
+ *  ok        – reviewed, first translation kept
+ *  corrected – reviewed, translation replaced once
+ *  failed    – QA request failed or returned nothing; first translation kept
+ */
+export type QaState = 'none' | 'skipped' | 'pending' | 'ok' | 'corrected' | 'failed';
+
+/** Post-translation checks of one block (translate/batch.ts); absent for skipped / failed blocks. */
+export interface BlockQuality {
+  /** Hash of the terminology entries relevant to this block (part of its cache key). */
+  terminologyHash: string;
+  /** Protected entities (citations, references, DOIs, URLs, e-mails) in the source. */
+  protectedEntities: number;
+  placeholderMissing: string[];
+  numericMissing: string[];
+  numericAdded: string[];
+  citationMissing: string[];
+  citationAdded: string[];
+  riskScore: number;
+  /** Every signal that fired (hard and soft). */
+  riskReasons: RiskReason[];
+  riskLevel: RiskLevel;
+  /** QA triggers that fired, in priority order; empty for soft risk. */
+  qaTriggers: QaTrigger[];
+  /** Hard risk: a QA candidate (`riskLevel === 'hard'`). */
+  highRisk: boolean;
+  qa: QaState;
+  /** Issue codes returned by the QA pass (NUMERIC_MISMATCH, NEGATION_ERROR, ...). */
+  qaIssues: string[];
+  /** First-round translation, kept when QA replaced it. */
+  originalTranslation: string | null;
+}
+
 export interface TranslationEntry {
   id: string;
   status: TranslationStatus;
   translation: string | null;
   error: string | null;
+  quality?: BlockQuality;
 }

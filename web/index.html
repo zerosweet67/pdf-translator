@@ -74,7 +74,9 @@
           <ol class="job-steps" id="job-steps">
             <li data-step="read">讀取 PDF</li>
             <li data-step="analyze">分析版面</li>
+            <li data-step="terminology">分析專業術語</li>
             <li data-step="translate">翻譯內容</li>
+            <li data-step="qa">檢查翻譯品質</li>
             <li data-step="generate">產生對照 PDF</li>
           </ol>
         </div>
@@ -120,6 +122,12 @@
           <button type="button" class="btn" id="debug-toggle">Show Debug Data</button>
         </div>
         <p class="hint" id="worker-info"></p>
+
+        <details class="unit-details" id="table-diagnostics" hidden>
+          <summary id="table-diagnostics-summary">Table Diagnostics</summary>
+          <label class="checkbox"><input type="checkbox" id="table-diagnostics-cells" /> show every cell (bbox, usable bbox, row / column, alignment, font size)</label>
+          <pre class="block-geom" id="table-diagnostics-list"></pre>
+        </details>
 
         <div id="blocks-panel" hidden>
           <div class="panel-header">
@@ -173,6 +181,14 @@
         <details class="unit-details" id="cost-stats" hidden open>
           <summary>Translation Cost Stats</summary>
           <pre class="block-geom" id="cost-stats-list"></pre>
+        </details>
+        <details class="unit-details" id="terminology-panel" hidden>
+          <summary id="terminology-summary">Terminology</summary>
+          <pre class="block-geom" id="terminology-list"></pre>
+        </details>
+        <details class="unit-details" id="qa-panel" hidden open>
+          <summary id="qa-summary">Quality Assurance</summary>
+          <pre class="block-geom" id="qa-list"></pre>
         </details>
       </section>
 

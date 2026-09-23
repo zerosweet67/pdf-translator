@@ -20,6 +20,7 @@ The app keeps PDF processing in the browser, sends only translatable text blocks
   - Noto Sans Symbols 2
   - Noto Sans TC fallback
 - Translation cache and token-cost optimizations
+- Academic fidelity pipeline: automatic document terminology, protected citations / references / DOIs / URLs, numeric and citation integrity checks, second-pass QA of high-risk blocks only
 - Invite-code protection with short-lived signed session tokens
 - Developer tools available with `?debug=true`
 
@@ -142,7 +143,9 @@ Enter invite code
 → Select PDF
 → Read PDF
 → Analyze layout
+→ Analyze terminology (one call)
 → Translate
+→ Check translation quality (high-risk blocks only)
 → Generate bilingual PDF
 → Download
 ```
@@ -186,6 +189,88 @@ Normally preserved without translation:
 - Numeric-only table cells
 - Equation-only blocks
 
+## Translation Quality (academic fidelity)
+
+Only English → Traditional Chinese (Taiwan) is supported. The pipeline puts fidelity before fluency: no expansion, no summary, no added causality, hedges (*may / might / could*, *suggest / indicate*, *associated with*, *approximately*), negations (*no significant difference*, *failed to demonstrate*, *not inferior*) and every number, statistic, symbol and citation must survive unchanged. The frontend modules live in `web/src/translate/`, the prompts in `worker/src/prompt.ts`.
+
+### Document terminology (`terminology.ts`, `POST /terminology`)
+
+- Before translation, **one** request builds the paper's glossary from selected excerpts of the already extracted blocks (title, opening paragraphs, headings, captions, sentences that define an abbreviation such as *chronic obstructive pulmonary disease (COPD)*, the most term-dense paragraph per page), at most ~7 000 characters. Small documents are sent whole. The PDF is never sent again.
+- Structured output `{ "terms": [{ "source", "target", "abbreviation" }] }`, at most 50 entries; ordinary words (patient, result, study, exercise…) and malformed entries are dropped.
+- **User terminology first**: entries typed in Developer Mode (`term = 中文`, or `term (ABBR) = 中文`) override automatic ones with the same source or abbreviation.
+- Each batch carries **only the entries that occur in its blocks** (term, plural, hyphen/space variant or the bare abbreviation), so a batch with only *COPD* and *inspiratory neural drive* sends two lines, never the whole glossary.
+- **Abbreviations**: first full mention → 中文全名（COPD）; afterwards, and whenever the source has only the abbreviation (COPD, ILD, FEV1, FVC, mMRC, CAT, HADS, RCT…), the bare abbreviation is kept and never expanded.
+- The glossary is cached in memory per document fingerprint for the page session, so a test run plus the full run, or a re-run of the same file, cost one extraction. No IndexedDB, no server storage.
+- If extraction fails the document is translated without an automatic glossary (warning in Developer Mode).
+
+### Protected entities (`protect.ts`)
+
+`[12]`, `[3–6]`, `[3,5,8]`, `(Smith et al., 2024)`, `(Smith & Lee, 2023; Wu, 2020)`, `Smith et al. (2024)`, `Figure 2`, `Fig. 2A`, `Figures 2 and 3`, `Table S1`, `Fig. B1`, `Supplementary Figure 3`, `Appendix A`, DOIs, URLs and e-mail addresses are replaced by placeholders (`__CITE_1__`, `__REF_1__`, `__DOI_1__`, `__URL_1__`, `__EMAIL_1__`) before the request and restored afterwards. Restoration tolerates small distortions (spacing, single underscores); a placeholder that does not come back is a warning and makes the block high-risk. A text that already contains such tokens is sent unprotected. Symbols and identifiers (SpO2, PaCO2, FEV1, TRPM8, ±, ≤, ≥, μ, Greek letters) stay in the text and the prompt forbids changing them.
+
+### Numeric / statistical integrity (`entities.ts`)
+
+Source and translation are compared on a semantic numeric signature: the multiset of numbers (sign, decimals, `%` flag) plus `p = / < / ≤ …`, `n = …` and `mean ± sd` entities. Equivalent: `95 %` / `95%`, `p=0.03` / `p = 0.03`, `5.2±1.1` / `5.2 ± 1.1`, `10-15` / `10–15` / `10 至 15`, `1,234` / `1234`, `.05` / `0.05`, `410 million` / `4.10 億`, number words / months / roman numerals rendered as digits, small digits rendered as Chinese numerals. Anything else missing, added or changed (`0.03 → 0.3`, `n = 42 → n = 24`, `12.4% → 12.5%`, `± 1.1 → ± 1.2`, a lost sign) is a numeric warning. A lost symbol (±, ≤, ≥, °, μ, Δ, Greek) is a separate warning.
+
+### Citation integrity
+
+The same patterns as the protection step are compared as a multiset between source and restored translation (dash variants and spacing normalized): a citation may not disappear, change its number, author, year or figure/table number.
+
+### Hard risk / soft risk (`risk.ts`)
+
+Every block is assessed after translation. Only **hard-risk** blocks, those with at least one QA trigger, are QA candidates; **soft-risk** blocks (weighting signals only) are reported in Developer Mode and never sent to QA on their own. A block whose deterministic checks all pass is not sent to QA just because it is merged, hedged, cut off or long.
+
+QA triggers, in priority order:
+
+| # | Trigger | Condition |
+| --- | --- | --- |
+| 1 | `PLACEHOLDER_ERROR` | a placeholder did not come back (**critical**) |
+| 2 | `NUMERIC_MISMATCH` | numbers / statistics differ (**critical**) |
+| 3 | `CITATION_MISMATCH` | citations differ (**critical**) |
+| 4 | `SYMBOL_MISMATCH` | ±, ≤, ≥, °, μ, Δ or a Greek letter lost |
+| 5 | `NEGATION_WITH_OUTCOME` | a conclusion-changing negation (*no significant difference*, *no evidence / effect*, *did not improve*, *failed to show*, *was not associated*, *not inferior / superior*, *neither … nor*, *no longer*, *cannot*) **in the same sentence** as a number, statistic, comparison or outcome word; *not only*, *not necessarily* are ignored |
+| 6 | `UNCERTAINTY_WITH_OUTCOME` | a hedge (*may, might, could, suggest, indicate, likely, possibly, plausible…*) **in the same sentence** as numeric / statistical content (*may reduce mortality by 15 %*); *this may reflect…* does not count |
+| 7 | `CROSS_PAGE_INCOMPLETE` | cross-page unit whose source is cut off |
+| 8 | `MERGED_INCOMPLETE_SEMANTIC` | merged unit, cut off, with a negation or hedge |
+| 9 | `HIGH_RISK_SCORE` | weighted score ≥ 8 without any specific trigger |
+
+Numbers inside citations, figure/table references, DOIs and URLs are not counted (they are removed before the numeric checks of the risk assessment).
+
+Weighting signals (score only; the score orders blocks of the same trigger class and feeds trigger 9): critical mismatch 8, lost symbol 4, strong negation 3, weak negation (*not*, *no*, *without*, *never*) 1, hedges 1 / 2 / 3 (1, 2–3, ≥ 4) + 1 for *approximately/about + number*, dense notation 3 / 2 / 1 (≥ 8 numbers or ≥ 3 statistics / ≥ 4 numbers or a statistic / ≥ 3 parentheses), merged 1, cross-page 1, cut-off source 1, length ratio outside 0.25–2.0 (source ≥ 60 chars) 2, + 3 when that block also carries numbers, a negation or a hedge.
+
+QA budget: after the triggers have selected the candidates, at most `DEFAULT_MAX_QA_SHARE` (5 %) of the translated blocks go to QA. **Critical mismatches (placeholder, numeric, citation) are always reviewed, even beyond the budget**; the remaining slots are filled in trigger priority order, then by score, then by reading order. Hard-risk blocks left out are reported as *skipped* in Developer Mode.
+
+### Second-pass QA (`qa.ts`, `POST /qa`)
+
+- Batches of at most 20 blocks / 16 000 characters (source + translation), same concurrency as translation. Each block carries only its id, source, current translation, block type (when not body text) and the QA triggers that fired; soft signals, entity details that passed the deterministic checks, section context and layout data are not sent. The glossary is filtered to the entries that occur in the batch.
+- The reviewer prompt is short (≈ 1 000 characters) and checks **only** meaning distortion, missing / added negation, altered uncertainty, numeric / statistical changes, citation changes, terminology inconsistency, missing or added content; it must not rewrite for style and returns `ok: true` when uncertain. Strict JSON: `{ "ok": true, "translation": null, "issues": [] }` or `{ "ok": false, "translation": "修正版", "issues": ["NUMERIC_MISMATCH", …] }` (codes: NUMERIC_MISMATCH, CITATION_MISMATCH, NEGATION_ERROR, UNCERTAINTY_ERROR, TERMINOLOGY_INCONSISTENCY, MISSING_CONTENT, ADDED_CONTENT, MEANING_DISTORTION, PLACEHOLDER_ERROR).
+- A translation is replaced **only** when `ok` is false and the correction passes a sanity check (non-empty, still Chinese, no new numeric error); the corrected text also replaces the cache entry. Each block is reviewed at most once and corrected at most once: there is no translate → QA → translate loop.
+- Ids missing from a reply are re-sent once on their own (the Worker also retries missing ids once); a block whose review never arrives, or a failed QA request, keeps its first-round translation. QA can never fail the document.
+
+### Cache key
+
+`targetLanguage + hash of the block's relevant terminology + whitespace-normalized text`. The same sentence under a different glossary is translated again; the full glossary is never part of the key.
+
+### Developer Mode
+
+`?debug=true` shows, after a run: **Terminology** (auto / user counts, every `source → target (ABBR) [origin]`), **Quality Assurance** (hard-risk / soft-risk counts, QA checked, QA corrected, correction rate, a *QA avoided* block with *soft-risk skipped by policy*, *hard-risk checked*, *critical mismatch forced QA* and *budget-skipped hard-risk*, the numeric / citation / placeholder warnings and the per-block list with level, score, triggers, signals, verdict and issue codes) and, in the cost panel, a **cost breakdown** (first-pass / terminology / QA / total: requests, input, output, total tokens) plus **QA efficiency** (QA checked, QA corrected, correction rate). Each block card carries a `hard-risk … [triggers] · QA ok / corrected / failed / skipped` or `soft-risk …` tag. User Mode only shows the stages 分析專業術語 → 翻譯 → 檢查翻譯品質 → 產生對照 PDF.
+
+### Cost impact (50-page single-column accounting paper, 237 blocks, real API, same model / glossary strategy)
+
+| | baseline (no quality pipeline) | A: QA off | B: previous policy, QA share 10 % | C: trigger policy, 5 % cap (current) |
+| --- | --- | --- | --- | --- |
+| terminology requests · tokens | – | 1 · 1 985 in / 861 out | 1 · 1 985 / 855 | 1 · 1 985 / 887 |
+| translation requests · tokens | 12 · 29 754 in / 28 442 out | 12 · 35 965 / 30 235 | 12 · 35 922 / 30 328 | 12 · 35 939 / 31 041 |
+| QA requests · blocks · corrected · tokens | – | – | 2 · 24 (10 %) · 3 · 11 135 / 1 698 | 1 · 12 (5 %) · 4 · 5 451 / 2 088 |
+| risk classes | – | 79 high-risk (old scoring) | 79 high-risk, 55 over budget | 48 hard / 163 soft, 2 critical forced, 36 budget-skipped |
+| total tokens | 58 196 | 69 046 (+19 %) | 81 923 (+41 %) | 77 391 (+33 %) |
+| price-weighted ($2 / $12 per 1M in / out) | $0.401 | $0.449 (+12 %) | $0.493 (+23 %) | $0.495 (+23 %) |
+| translation + QA time | 85 s | 97 s | 110 s (95 + 14) | 118 s (96 + 22) |
+| total time (upload → PDF) | 88.8 s | 109 s | 120 s | 129 s |
+
+A, B and C ran back to back in one session; the baseline numbers come from the earlier run before the quality pipeline (API latency was lower that day: A, with no QA at all, already takes 97 s of translation). Compared with B, the trigger policy sends half the blocks to QA, cuts QA tokens by 41 % and still corrected four blocks: two were forced by a numeric mismatch (an invented section reference; a dropped table header), one removed a duplicated fragment, one was a wording fix. Replaying the policy over B's own first-round output keeps two of its three corrections (the third was a merged-only block, now soft risk). The remaining growth over the baseline is the first pass (+15 %: fidelity prompt, glossary lines, placeholders) and terminology (+5 %); QA is +13 % of the baseline.
+
+QA batch size was benchmarked on B's 24 review blocks (24 100 chars): 20 blocks / 16 000 chars → 2 requests, 14 316 tokens, 38.6 s; 15 blocks / 12 000 chars → 3 requests, 15 680 tokens, 46.9 s. The larger batch stays.
+
 ## PDF Export
 
 Default export mode:
@@ -202,6 +287,43 @@ Output filename:
 
 Developer Mode can also generate a translated-only PDF.
 
+### Tables (`web/src/pdf/table.ts`)
+
+Text inside a detected table (caption → `TABLE` blocks, `classify.ts`) is not
+treated as paragraphs. Its raw text items are regrouped into logical cells:
+
+```text
+text items → baseline rows → fragments (wide gaps) → column bands
+           → wrapped lines merged per cell → one translation unit per cell
+```
+
+- Column bands come from the x-projection of the data rows only, so a
+  spanning header ("Bedbound (n = 590)") never merges two data columns.
+- Wrapped lines join one cell only when they leave data columns empty and
+  continue the text (lowercase / "(" start, trailing comma, hanging indent),
+  never across a table rule.
+- Superscript footnote markers ("Medicaid^d") stay with their cell, are kept
+  out of the translated text and are drawn back after the translation.
+- Numeric cells (`isNumericTableCell`: numbers, %, ±, ranges, p-values,
+  n =, "—", NA …) are never sent to the API.
+- Each cell gets a usable rectangle inside its row / column band, 1 pt clear
+  of every ruling line (`extract.ts` collects rules and fills from the
+  operator list). Masks are the union of the cell's source lines clipped to
+  that rectangle, in the cell's background colour, so borders and shading
+  survive.
+- Table-only fitting (`fitTextToTableCell`): wrap → line height 1.15 → 1.08 ×
+  font size → font −0.25 pt steps down to 5 pt. No downward extension. A cell
+  that still does not fit keeps its English text and is listed as
+  `TABLE_CELL_OVERFLOW` in Developer Mode → Table Diagnostics.
+- Cell units are sent with `type: "TABLE_CELL"` (short guidance in the
+  Worker prompt); batching, cache and QA are unchanged.
+- A table whose cells cannot be resolved (no column structure) keeps its
+  blocks in English instead of overlaying them.
+
+Benchmark harness (no API calls): `TABLE_BENCH_PDF=<file> TABLE_BENCH_OUT=<dir>
+TABLE_BENCH_PAGES=6,7 npx vitest run src/pdf/__tests__/table.bench.test.ts`
+writes before / after / debug PDFs and `metrics.json`.
+
 ## Translation Cost Optimizations
 
 The frontend minimizes unnecessary API usage by:
@@ -212,7 +334,9 @@ The frontend minimizes unnecessary API usage by:
 - Skipping numeric-only, DOI-only, URL-only and reference blocks
 - Reusing in-session translation cache
 - Retrying only missing block IDs when possible
-- Filtering terminology so only relevant entries are sent
+- Filtering terminology so only relevant entries are sent (per block for the cache key, per batch for the request)
+- Sending the block type only for non-body blocks (TITLE / HEADING / CAPTION / FOOTNOTE / TABLE)
+- Reviewing only hard-risk blocks in the QA pass (deterministic mismatches, negation / uncertainty next to numbers or outcomes), capped at 5 % of the translated blocks except for critical mismatches
 - Keeping PDF generation completely separate from translation calls
 
 ## Authentication
@@ -241,7 +365,7 @@ POST /auth/verify
 → send Authorization: Bearer <token> to /translate
 ```
 
-`/translate` verifies the token before calling OpenAI.
+`/translate`, `/terminology` and `/qa` verify the token before calling OpenAI.
 
 Worker routes (any other method answers `405` with an `Allow` header):
 
@@ -249,8 +373,12 @@ Worker routes (any other method answers `405` with an `Allow` header):
 GET  /health        → { "ok": true }            public liveness, nothing else
 GET  /auth/check    → session status + provider/model (needs a token)
 POST /auth/verify   → invite code → session token
-POST /translate     → text blocks → translations   (needs a token)
+POST /translate     → text blocks → translations                       (needs a token)
+POST /terminology   → text excerpts → document glossary (one per PDF)   (needs a token)
+POST /qa            → source + translation of high-risk blocks → verdicts (needs a token)
 ```
+
+The three provider routes share one pipeline (auth → body cap → validation → the same per-session rate limits, character budget and concurrency lease → provider), so a QA or terminology request counts against the same limits as a translation request.
 
 ## Production Deployment
 
@@ -370,7 +498,7 @@ The Worker is the only component that holds secrets and the only one that can sp
 - **Session tokens** are `base64url(payload).base64url(HMAC-SHA256(AUTH_SECRET, payload))`, valid for `TOKEN_TTL_SECONDS` (24 h, `worker/src/config.ts`). Verification checks format, signature length, HMAC, `v == 1`, integer `iat`/`exp`, a base64url `sid`, `exp > now`, `iat` not in the future and a lifetime of at most the TTL. Every failure is the same `401 { "error": "UNAUTHORIZED" }`.
 - **Browser storage**: the token lives in `sessionStorage` only (closing the tab ends the session) and is never put in a URL, the DOM, analytics or the Developer Mode panel.
 - **CORS**: an explicit origin allowlist (`ALLOWED_ORIGINS` in `wrangler.toml`), never `*`. Requests and preflights from any other origin get `403`. Allowed methods `GET, POST, OPTIONS`, allowed headers `Content-Type, Authorization`.
-- **Strict input**: `POST` routes require `Content-Type: application/json` (`415` otherwise). Bodies are capped (`4 KB` for `/auth/verify`, `512 KB` for `/translate`, checked on `Content-Length` and again while reading → `413`). `/translate` also enforces at most 50 blocks, 6 000 characters per block, 40 000 characters per request, 600-character contexts and 200 terminology entries.
+- **Strict input**: `POST` routes require `Content-Type: application/json` (`415` otherwise). Bodies are capped (`4 KB` for `/auth/verify`, `512 KB` for `/translate`, checked on `Content-Length` and again while reading → `413`). `/translate` also enforces at most 50 blocks, 6 000 characters per block, 40 000 characters per request, 600-character contexts, an upper-case block `type` and 200 terminology entries. `/terminology` (`128 KB`) accepts at most 40 excerpts of 2 000 characters, 16 000 in total; `/qa` (`512 KB`) at most 20 blocks, 6 000 characters per source / translation, 60 000 in total and 12 upper-case warning codes per block.
 - **Security headers** on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Cache-Control: no-store`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`.
 - **Request ids**: every response carries `X-Request-ID`; the frontend prints it to the browser console on failures so a problem can be matched with the Worker log without exposing anything else.
 - **Safe errors**: users see one of a handful of generic messages (login expired / too many attempts / too many requests / file too large / service problem). Provider errors and stack traces stay in the Worker log.
@@ -449,8 +577,11 @@ Expected: `{"ok":true}`, `{"error":"UNAUTHORIZED"}`, then `401 401 401 401 401 4
 - Rotated pages / rotated text are not fully supported
 - Three-column layouts are not fully supported
 - Figure text embedded only as raster image is not translated
-- Table reconstruction is heuristic
-- Translation cache is in-memory only
+- Table reconstruction is heuristic: tables need a "Table N" caption; a wrapped header line that starts with a capital letter and has no continuation signal stays a separate cell; a translation that does not fit a cell even at 5 pt is left in English; a caption's translation may still grow downward over the first table rule (general block fitting)
+- Translation cache and the automatic glossary are in-memory only (per page session)
+- Numeric and citation checks are heuristic: a value the translator legitimately rewrites (e.g. "12 percent" → "百分之十二" in words) is reported as a warning and reviewed, and a wrong value that keeps the same digits (e.g. a swapped pair of identical numbers) is not detected
+- Only hard-risk blocks are reviewed and the QA share is capped at 5 % of the blocks (critical mismatches excepted), so a paper with many negated or hedged findings leaves some hard-risk blocks unreviewed (listed as "skipped" in Developer Mode); soft-risk blocks (merged, cross-page, cut off, hedged or long without a trigger) are never reviewed
+- Figure / table references are kept in English ("Figure 2"), never rendered as 圖 2
 - Access control uses one shared invite code, not individual accounts
 - Rate limits are per invite-code session and per source IP, not per person; users behind one shared IP share the 5-attempts-per-minute invite limit
 - Original English may remain searchable under white overlay masks in the generated PDF

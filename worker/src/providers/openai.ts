@@ -1,18 +1,42 @@
 /**
  * OpenAI provider (default). Uses the Responses API with a strict JSON schema
- * so the reply always has the { blocks: [{id, translation}] } shape.
+ * so every reply has the expected shape: { blocks: [{id, translation}] } for
+ * translation, { terms: [...] } for terminology extraction and
+ * { blocks: [{id, ok, translation, issues}] } for the QA pass.
  *
  * Quality-first, light reasoning: the model is a GPT-5.6 tier model and
  * `reasoning.effort` defaults to "low". Both are configurable in wrangler.toml.
  */
 
-import { OUTPUT_SCHEMA, buildSystemPrompt, buildUserMessage } from '../prompt';
-import type { RequestBlock } from '../validate';
-import { ProviderError, normalizeTranslations, type ProviderResult, type TranslationProvider } from './types';
+import {
+  OUTPUT_SCHEMA,
+  QA_SCHEMA,
+  TERMINOLOGY_PROMPT,
+  TERMINOLOGY_SCHEMA,
+  buildQaMessage,
+  buildQaSystemPrompt,
+  buildSystemPrompt,
+  buildTerminologyMessage,
+  buildUserMessage,
+} from '../prompt';
+import type { QaRequestBlock, RequestBlock } from '../validate';
+import {
+  ProviderError,
+  normalizeTerms,
+  normalizeTranslations,
+  normalizeVerdicts,
+  type ProviderResult,
+  type ProviderUsage,
+  type QaResult,
+  type TerminologyResult,
+  type TranslationProvider,
+} from './types';
 
 const ENDPOINT = 'https://api.openai.com/v1/responses';
 const REQUEST_TIMEOUT_MS = 110_000;
 const MAX_OUTPUT_TOKENS = 16_000;
+/** The glossary is at most 50 short entries. */
+const TERMINOLOGY_MAX_OUTPUT_TOKENS = 4000;
 
 interface ResponsesOutputContent {
   type: string;
@@ -38,6 +62,20 @@ interface ResponsesReply {
   error?: { message?: string; type?: string; code?: string } | null;
 }
 
+interface StructuredCall {
+  instructions: string;
+  input: string;
+  schemaName: string;
+  schema: unknown;
+  maxOutputTokens: number;
+}
+
+interface StructuredReply {
+  parsed: unknown;
+  model: string;
+  usage: ProviderUsage | undefined;
+}
+
 function retryAfterSeconds(headers: Headers): number | undefined {
   const n = Number(headers.get('retry-after'));
   return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -55,20 +93,50 @@ export class OpenAIProvider implements TranslationProvider {
     this.effort = effort && effort.trim() ? effort.trim() : 'low';
   }
 
-  async translate(
-    blocks: RequestBlock[],
-    targetLanguage: string,
-    terminology: Record<string, string>,
-  ): Promise<ProviderResult> {
+  async translate(blocks: RequestBlock[], targetLanguage: string, terminology: Record<string, string>): Promise<ProviderResult> {
+    const reply = await this.structured({
+      instructions: buildSystemPrompt(terminology, blocks),
+      input: buildUserMessage(blocks, targetLanguage),
+      schemaName: 'translations',
+      schema: OUTPUT_SCHEMA,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+    });
+    return { blocks: normalizeTranslations(reply.parsed), model: reply.model, usage: reply.usage };
+  }
+
+  async extractTerminology(samples: string[]): Promise<TerminologyResult> {
+    const reply = await this.structured({
+      instructions: TERMINOLOGY_PROMPT,
+      input: buildTerminologyMessage(samples),
+      schemaName: 'terminology',
+      schema: TERMINOLOGY_SCHEMA,
+      maxOutputTokens: TERMINOLOGY_MAX_OUTPUT_TOKENS,
+    });
+    return { terms: normalizeTerms(reply.parsed), model: reply.model, usage: reply.usage };
+  }
+
+  async reviewTranslations(blocks: QaRequestBlock[], targetLanguage: string, terminology: Record<string, string>): Promise<QaResult> {
+    const reply = await this.structured({
+      instructions: buildQaSystemPrompt(terminology, blocks),
+      input: buildQaMessage(blocks, targetLanguage),
+      schemaName: 'qa_review',
+      schema: QA_SCHEMA,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+    });
+    return { blocks: normalizeVerdicts(reply.parsed), model: reply.model, usage: reply.usage };
+  }
+
+  /** One Responses API call with a strict JSON schema; every failure becomes a ProviderError. */
+  private async structured(call: StructuredCall): Promise<StructuredReply> {
     const body = {
       model: this.model,
-      instructions: buildSystemPrompt(terminology, blocks),
-      input: [{ role: 'user', content: buildUserMessage(blocks, targetLanguage) }],
+      instructions: call.instructions,
+      input: [{ role: 'user', content: call.input }],
       reasoning: { effort: this.effort },
       text: {
-        format: { type: 'json_schema', name: 'translations', strict: true, schema: OUTPUT_SCHEMA },
+        format: { type: 'json_schema', name: call.schemaName, strict: true, schema: call.schema },
       },
-      max_output_tokens: MAX_OUTPUT_TOKENS,
+      max_output_tokens: call.maxOutputTokens,
       store: false,
     };
 
@@ -134,7 +202,7 @@ export class OpenAIProvider implements TranslationProvider {
       if (item.type !== 'message') continue;
       for (const part of item.content ?? []) {
         if (part.type === 'refusal') {
-          throw new ProviderError(502, 'provider_refusal', 'The model declined to translate this batch.');
+          throw new ProviderError(502, 'provider_refusal', 'The model declined to process this batch.');
         }
         if (part.type === 'output_text' && typeof part.text === 'string') text += part.text;
       }
@@ -154,6 +222,6 @@ export class OpenAIProvider implements TranslationProvider {
           cachedInputTokens: reply.usage.input_tokens_details?.cached_tokens ?? 0,
         }
       : undefined;
-    return { blocks: normalizeTranslations(parsed), model: reply.model ?? this.model, usage };
+    return { parsed, model: reply.model ?? this.model, usage };
   }
 }

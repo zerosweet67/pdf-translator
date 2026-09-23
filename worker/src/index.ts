@@ -4,9 +4,12 @@
  *   GET  /health        → { ok:true }                      (public liveness, nothing else)
  *   GET  /auth/check    → 200 { ok:true, expiresAt, provider, model, effort } | 401   (bearer token)
  *   POST /auth/verify   { code } → 200 { ok:true, token, expiresAt } | 401 { ok:false } | 429 TOO_MANY_ATTEMPTS
- *   POST /translate     { blocks:[{id,text,contextBefore?,contextAfter?,incompleteSource?}], targetLanguage:"zh-TW" }
+ *   POST /translate     { blocks:[{id,text,contextBefore?,contextAfter?,incompleteSource?,type?}], targetLanguage:"zh-TW", terminology? }
  *                       → { blocks:[{id,translation}], missing:[...], provider, model, usage, providerCalls }
- *                       requires Authorization: Bearer <session token>; 401 UNAUTHORIZED before any provider call
+ *   POST /terminology   { samples:[string], targetLanguage } → { terms:[{source,target,abbreviation}], provider, model, usage }
+ *   POST /qa            { blocks:[{id,source,translation,type?,issues?}], targetLanguage, terminology? }
+ *                       → { blocks:[{id,ok,translation,issues}], missing:[...], provider, model, usage, providerCalls }
+ *                       all three require Authorization: Bearer <session token>; 401 UNAUTHORIZED before any provider call
  *
  * Every response carries X-Request-ID plus security headers. Error bodies are
  * { error: "<CODE>" } (+ a generic `message` for 4xx validation problems); they
@@ -30,7 +33,13 @@ import { buildCorsHeaders, isOriginAllowed, parseAllowedOrigins } from './cors';
 import type { Env } from './env';
 import { mergeTerminology } from './prompt';
 import { createProvider } from './providers';
-import { ProviderError, type ProviderTranslation, type ProviderUsage, type TranslationProvider } from './providers/types';
+import {
+  ProviderError,
+  type ProviderQaVerdict,
+  type ProviderTranslation,
+  type ProviderUsage,
+  type TranslationProvider,
+} from './providers/types';
 import { createRateLimiter, type AdmitResult, type RateLimiterBackend } from './ratelimit';
 import {
   clientIp,
@@ -42,7 +51,14 @@ import {
   shortHash,
   withSecurityHeaders,
 } from './security';
-import { ValidationError, validateTranslateRequest, type RequestBlock } from './validate';
+import {
+  ValidationError,
+  validateQaRequest,
+  validateTerminologyRequest,
+  validateTranslateRequest,
+  type QaRequestBlock,
+  type RequestBlock,
+} from './validate';
 
 // The Durable Object class must be exported from the Worker entry point.
 export { RateLimiterDO } from './ratelimit';
@@ -53,6 +69,8 @@ const ROUTES: Record<string, readonly string[]> = {
   '/auth/check': ['GET'],
   '/auth/verify': ['POST'],
   '/translate': ['POST'],
+  '/terminology': ['POST'],
+  '/qa': ['POST'],
 };
 
 interface RequestContext {
@@ -90,18 +108,24 @@ function cleanTranslation(text: string): string {
   return text.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+interface VerifiedCall<T> {
+  results: Map<string, T>;
+  missing: string[];
+  usage: ProviderUsage;
+  providerCalls: number;
+}
+
 /**
  * Call the provider, then check that every requested id came back.
- * Ids that are missing are re-sent once on their own.
+ * Ids that are missing are re-sent once on their own. Shared by /translate and /qa.
  */
-async function translateWithVerification(
-  provider: TranslationProvider,
-  blocks: RequestBlock[],
-  targetLanguage: string,
-  terminology: Record<string, string>,
-): Promise<{ translations: Map<string, string>; missing: string[]; usage: ProviderUsage; providerCalls: number }> {
+async function callWithVerification<B extends { id: string }, T extends { id: string }>(
+  blocks: B[],
+  call: (subset: B[]) => Promise<{ items: T[]; usage?: ProviderUsage }>,
+  accept: (item: T) => boolean,
+): Promise<VerifiedCall<T>> {
   const wanted = new Set(blocks.map((b) => b.id));
-  const translations = new Map<string, string>();
+  const results = new Map<string, T>();
   const usage: ProviderUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
   let providerCalls = 0;
   const account = (u: ProviderUsage | undefined) => {
@@ -111,34 +135,68 @@ async function translateWithVerification(
     usage.outputTokens += u.outputTokens;
     usage.cachedInputTokens += u.cachedInputTokens;
   };
-
-  const absorb = (results: ProviderTranslation[]) => {
-    for (const r of results) {
+  const absorb = (items: T[]) => {
+    for (const r of items) {
       if (!wanted.has(r.id)) continue; // ignore invented ids
-      const clean = cleanTranslation(r.translation);
-      if (clean.length > 0 && !translations.has(r.id)) translations.set(r.id, clean);
+      if (accept(r) && !results.has(r.id)) results.set(r.id, r);
     }
   };
 
-  const first = await provider.translate(blocks, targetLanguage, terminology);
+  const first = await call(blocks);
   account(first.usage);
-  absorb(first.blocks);
+  absorb(first.items);
 
-  let missing = blocks.filter((b) => !translations.has(b.id));
+  let missing = blocks.filter((b) => !results.has(b.id));
   if (missing.length > 0) {
-    console.warn(`[translate] ${missing.length} of ${blocks.length} ids missing, retrying those once`);
+    console.warn(`[provider] ${missing.length} of ${blocks.length} ids missing, retrying those once`);
     try {
-      const second = await provider.translate(missing, targetLanguage, terminology);
+      const second = await call(missing);
       account(second.usage);
-      absorb(second.blocks);
+      absorb(second.items);
     } catch (err) {
       // Keep what we have; the frontend re-sends missing ids itself.
-      console.warn('[translate] retry for missing ids failed', err instanceof Error ? err.message : 'error');
+      console.warn('[provider] retry for missing ids failed', err instanceof Error ? err.message : 'error');
     }
-    missing = blocks.filter((b) => !translations.has(b.id));
+    missing = blocks.filter((b) => !results.has(b.id));
   }
 
-  return { translations, missing: missing.map((b) => b.id), usage, providerCalls };
+  return { results, missing: missing.map((b) => b.id), usage, providerCalls };
+}
+
+function translateWithVerification(
+  provider: TranslationProvider,
+  blocks: RequestBlock[],
+  targetLanguage: string,
+  terminology: Record<string, string>,
+): Promise<VerifiedCall<ProviderTranslation>> {
+  return callWithVerification<RequestBlock, ProviderTranslation>(
+    blocks,
+    async (subset) => {
+      const r = await provider.translate(subset, targetLanguage, terminology);
+      return { items: r.blocks.map((b) => ({ id: b.id, translation: cleanTranslation(b.translation) })), usage: r.usage };
+    },
+    (item) => item.translation.length > 0,
+  );
+}
+
+function reviewWithVerification(
+  provider: TranslationProvider,
+  blocks: QaRequestBlock[],
+  targetLanguage: string,
+  terminology: Record<string, string>,
+): Promise<VerifiedCall<ProviderQaVerdict>> {
+  return callWithVerification<QaRequestBlock, ProviderQaVerdict>(
+    blocks,
+    async (subset) => {
+      const r = await provider.reviewTranslations(subset, targetLanguage, terminology);
+      return {
+        items: r.blocks.map((v) => ({ ...v, translation: v.ok ? null : v.translation ? cleanTranslation(v.translation) : null })),
+        usage: r.usage,
+      };
+    },
+    // a "not ok" verdict without a correction is useless: treat it as missing so it is retried once
+    (item) => item.ok || (item.translation !== null && item.translation.length > 0),
+  );
 }
 
 /** Body read + size / JSON errors mapped to responses. */
@@ -209,7 +267,21 @@ async function handleAuthVerify(ctx: RequestContext, request: Request): Promise<
   return json({ ok: true, token, expiresAt: payload.exp * 1000 }, 200, ctx.cors);
 }
 
-async function handleTranslate(ctx: RequestContext, request: Request): Promise<Response> {
+interface ProviderTask<T> {
+  /** Body size cap for this route. */
+  maxBytes: number;
+  parse: (body: unknown) => T;
+  /** Source characters, for the per-session character budget. */
+  chars: (parsed: T) => number;
+  /** The provider work; returns the JSON body (provider / model are added) and a log line. */
+  run: (provider: TranslationProvider, parsed: T) => Promise<{ body: Record<string, unknown>; log: string }>;
+}
+
+/**
+ * Shared pipeline of the three provider routes: auth → body → validation →
+ * per-session limits (atomic, one round trip) → provider → response.
+ */
+async function handleProviderTask<T>(ctx: RequestContext, request: Request, task: ProviderTask<T>): Promise<Response> {
   const { env } = ctx;
   // Auth first: an unauthenticated request never reaches body parsing or the provider.
   const session = await authenticate(request, env);
@@ -218,12 +290,12 @@ async function handleTranslate(ctx: RequestContext, request: Request): Promise<R
     return unauthorized(ctx);
   }
 
-  const read = await readBody(ctx, request, MAX_BODY_BYTES.translate);
+  const read = await readBody(ctx, request, task.maxBytes);
   if ('response' in read) return read.response;
 
-  let parsed;
+  let parsed: T;
   try {
-    parsed = validateTranslateRequest(read.body);
+    parsed = task.parse(read.body);
   } catch (err) {
     const message = err instanceof ValidationError ? err.message : 'Invalid request.';
     return fail(ctx, 400, 'INVALID_REQUEST', message);
@@ -231,8 +303,7 @@ async function handleTranslate(ctx: RequestContext, request: Request): Promise<R
 
   // Per-session limits, checked atomically in one round trip: requests / minute,
   // translated characters / 5 minutes, and a lease for the concurrency cap.
-  let chars = 0;
-  for (const b of parsed.blocks) chars += b.text.length;
+  const chars = task.chars(parsed);
   const sessionKey = `session:${session.sid}`;
   const decision = await admit(ctx, sessionKey, {
     buckets: [
@@ -265,30 +336,20 @@ async function handleTranslate(ctx: RequestContext, request: Request): Promise<R
   } catch (err) {
     releaseLease();
     if (err instanceof ProviderError) {
-      console.error(`[translate] provider not configured: ${err.message}`);
+      console.error(`[${ctx.route}] provider not configured: ${err.message}`);
       return fail(ctx, 500, 'PROVIDER_NOT_CONFIGURED');
     }
     throw err;
   }
 
   try {
-    const { translations, missing, usage, providerCalls } = await translateWithVerification(
-      provider,
-      parsed.blocks,
-      parsed.targetLanguage,
-      mergeTerminology(parsed.terminology),
-    );
-    const blocks = parsed.blocks
-      .filter((b) => translations.has(b.id))
-      .map((b) => ({ id: b.id, translation: translations.get(b.id) as string }));
-    console.log(
-      `[usage] requestId=${ctx.requestId} blocks=${parsed.blocks.length} chars=${chars} calls=${providerCalls} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} missing=${missing.length}`,
-    );
-    return json({ blocks, missing, provider: provider.name, model: provider.model, usage, providerCalls }, 200, ctx.cors);
+    const { body, log } = await task.run(provider, parsed);
+    console.log(`[usage] route=${ctx.route} requestId=${ctx.requestId} chars=${chars} ${log}`);
+    return json({ ...body, provider: provider.name, model: provider.model }, 200, ctx.cors);
   } catch (err) {
     if (err instanceof ProviderError) {
       // ProviderError messages are written by this Worker (never the provider's raw body).
-      console.error(`[translate] requestId=${ctx.requestId} provider error ${err.status} ${err.code}: ${err.message}`);
+      console.error(`[${ctx.route}] requestId=${ctx.requestId} provider error ${err.status} ${err.code}: ${err.message}`);
       const extra = err.retryAfterSeconds !== undefined ? { 'Retry-After': String(Math.ceil(err.retryAfterSeconds)) } : undefined;
       const status = err.status === 429 ? 429 : err.status >= 500 ? err.status : 502;
       const code = status === 429 ? 'PROVIDER_RATE_LIMITED' : 'PROVIDER_ERROR';
@@ -304,6 +365,73 @@ async function handleTranslate(ctx: RequestContext, request: Request): Promise<R
   } finally {
     releaseLease();
   }
+}
+
+function usageLog(usage: ProviderUsage, calls: number): string {
+  return `calls=${calls} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens}`;
+}
+
+function handleTranslate(ctx: RequestContext, request: Request): Promise<Response> {
+  return handleProviderTask(ctx, request, {
+    maxBytes: MAX_BODY_BYTES.translate,
+    parse: validateTranslateRequest,
+    chars: (p) => p.blocks.reduce((n, b) => n + b.text.length, 0),
+    run: async (provider, parsed) => {
+      const { results, missing, usage, providerCalls } = await translateWithVerification(
+        provider,
+        parsed.blocks,
+        parsed.targetLanguage,
+        mergeTerminology(parsed.terminology),
+      );
+      const blocks = parsed.blocks
+        .filter((b) => results.has(b.id))
+        .map((b) => ({ id: b.id, translation: (results.get(b.id) as ProviderTranslation).translation }));
+      return {
+        body: { blocks, missing, usage, providerCalls },
+        log: `blocks=${parsed.blocks.length} ${usageLog(usage, providerCalls)} missing=${missing.length}`,
+      };
+    },
+  });
+}
+
+/** One call per document: excerpts in, glossary out. The frontend validates and caps the terms again. */
+function handleTerminology(ctx: RequestContext, request: Request): Promise<Response> {
+  return handleProviderTask(ctx, request, {
+    maxBytes: MAX_BODY_BYTES.terminology,
+    parse: validateTerminologyRequest,
+    chars: (p) => p.samples.reduce((n, s) => n + s.length, 0),
+    run: async (provider, parsed) => {
+      const result = await provider.extractTerminology(parsed.samples);
+      const usage = result.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+      return {
+        body: { terms: result.terms, usage, providerCalls: 1 },
+        log: `samples=${parsed.samples.length} terms=${result.terms.length} ${usageLog(usage, 1)}`,
+      };
+    },
+  });
+}
+
+/** Second-pass review of high-risk blocks; the frontend decides which blocks and applies corrections. */
+function handleQa(ctx: RequestContext, request: Request): Promise<Response> {
+  return handleProviderTask(ctx, request, {
+    maxBytes: MAX_BODY_BYTES.qa,
+    parse: validateQaRequest,
+    chars: (p) => p.blocks.reduce((n, b) => n + b.source.length + b.translation.length, 0),
+    run: async (provider, parsed) => {
+      const { results, missing, usage, providerCalls } = await reviewWithVerification(
+        provider,
+        parsed.blocks,
+        parsed.targetLanguage,
+        mergeTerminology(parsed.terminology),
+      );
+      const blocks = parsed.blocks.filter((b) => results.has(b.id)).map((b) => results.get(b.id) as ProviderQaVerdict);
+      const corrected = blocks.filter((b) => !b.ok).length;
+      return {
+        body: { blocks, missing, usage, providerCalls },
+        log: `blocks=${parsed.blocks.length} corrected=${corrected} ${usageLog(usage, providerCalls)} missing=${missing.length}`,
+      };
+    },
+  });
 }
 
 async function handleAuthCheck(ctx: RequestContext, request: Request): Promise<Response> {
@@ -365,6 +493,10 @@ async function route(request: Request, env: Env, requestId: string, waitUntil: R
       return handleAuthVerify(ctx, request);
     case '/translate':
       return handleTranslate(ctx, request);
+    case '/terminology':
+      return handleTerminology(ctx, request);
+    case '/qa':
+      return handleQa(ctx, request);
     default:
       return fail(ctx, 404, 'NOT_FOUND');
   }

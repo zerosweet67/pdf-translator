@@ -33,4 +33,8 @@ export const MAX_BODY_BYTES = {
   authVerify: 4 * 1024,
   /** 50 blocks x 6000 chars + contexts + terminology stays well below this even as multi-byte UTF-8. */
   translate: 512 * 1024,
+  /** 40 excerpts x 2000 chars (16 000 chars in total). */
+  terminology: 128 * 1024,
+  /** 20 blocks x (source + translation) + terminology. */
+  qa: 512 * 1024,
 } as const;

@@ -1,8 +1,12 @@
 /**
- * In-memory translation cache: (target language, normalized text) → translation.
+ * In-memory translation cache: (target language, terminology hash, normalized text) → translation.
  * Lives for the page session only, so repeated labels inside one PDF
  * ("Figure", "Baseline", "Results", table headers, questionnaire items) and
  * a re-run on the same file cost no API call. IndexedDB may replace it later.
+ *
+ * The terminology hash is the stable hash of the glossary entries that are
+ * relevant to the text (terminology.ts): the same English sentence translated
+ * under a different glossary must not hit the old entry.
  */
 
 /**
@@ -11,25 +15,25 @@
  * case, punctuation and citations stay, so different text never collides.
  */
 export function normalizeCacheText(text: string): string {
-  return text.replace(/[\s   -​  　﻿]+/g, ' ').trim();
+  return text.replace(/[\s\u00a0\u1680\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]+/g, ' ').trim();
 }
 
 export class TranslationCache {
   private readonly map = new Map<string, string>();
   private hitCount = 0;
 
-  private key(text: string, targetLanguage: string): string {
-    return `${targetLanguage}\u0000${normalizeCacheText(text)}`;
+  private key(text: string, targetLanguage: string, terminologyHash: string): string {
+    return `${targetLanguage}\u0000${terminologyHash}\u0000${normalizeCacheText(text)}`;
   }
 
-  get(text: string, targetLanguage: string): string | undefined {
-    const hit = this.map.get(this.key(text, targetLanguage));
+  get(text: string, targetLanguage: string, terminologyHash = ''): string | undefined {
+    const hit = this.map.get(this.key(text, targetLanguage, terminologyHash));
     if (hit !== undefined) this.hitCount++;
     return hit;
   }
 
-  set(text: string, targetLanguage: string, translation: string): void {
-    this.map.set(this.key(text, targetLanguage), translation);
+  set(text: string, targetLanguage: string, translation: string, terminologyHash = ''): void {
+    this.map.set(this.key(text, targetLanguage, terminologyHash), translation);
   }
 
   get size(): number {

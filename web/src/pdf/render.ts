@@ -38,12 +38,22 @@ import {
 import { fitTextToBoxes, type BoxSpec, MAX_EXTENSION_RATIO } from './fit';
 import { embedFontSet, FontLoadError, MixedFont, sanitizeForFont, type FontSetBytes, type TextRun } from './font';
 import { GLYPH_ASCENT, GLYPH_DESCENT } from './layout';
+import {
+  clipMaskToRules,
+  fitTextToTableCell,
+  placeTableCellLines,
+  tableCellMaskRects,
+  type CellPlacement,
+  type TableFitResult,
+} from './table';
 import type {
   BlockType,
   ImageBox,
   LayoutResult,
   PageDebugInfo,
   PdfAnalysis,
+  Rect,
+  TableCellInfo,
   TextBlock,
   TextLine,
   TranslationBlock,
@@ -96,11 +106,25 @@ export interface RenderProgress {
   percent: number;
 }
 
+/** Table-cell details of a report (Developer Mode table diagnostics). */
+export interface CellReport {
+  tableId: number;
+  row: number;
+  column: number;
+  sourceText: string;
+  /** Font size at which the cell still did not fit (overflow), or the size it was drawn with. */
+  finalFontSize: number;
+  /** HEIGHT / WIDTH when the cell overflowed, null when it was written. */
+  overflowReason: string | null;
+}
+
 export interface BlockRenderReport {
   unitId: string;
   sourceBlockIds: string[];
   page: number;
   type: BlockType;
+  /** Present for logical table cells. */
+  cell?: CellReport;
   /** Original font size of the first source block. */
   fontSize: number;
   finalFontSize: number | null;
@@ -124,6 +148,12 @@ export interface RenderStats {
   replacedChars: number;
   /** Total glyphs drawn with the fallback font (see BlockRenderReport.fallbackGlyphs). */
   fontFallbackCount: number;
+  /** Logical table cells with a translation on the rendered pages. */
+  tableCells: number;
+  /** Table cells masked and rewritten. */
+  tableCellsWritten: number;
+  /** Table cells whose translation did not fit even at the minimum size: kept in English. */
+  tableCellsOverflow: number;
 }
 
 export interface RenderResult {
@@ -315,6 +345,7 @@ function extensionFor(block: TextBlock, page: PageDebugInfo): number {
 // ---------------------------------------------------------------------------
 
 const WHITE = rgb(1, 1, 1);
+const ORANGE = rgb(0.95, 0.5, 0.05);
 const RED = rgb(0.85, 0.1, 0.1);
 const BLUE = rgb(0.15, 0.35, 0.9);
 const GREY = rgb(0.55, 0.55, 0.55);
@@ -366,13 +397,50 @@ function pagePlacement(pageInfo: PageDebugInfo, offsetX: number): PagePlacement 
   };
 }
 
+/** "#f4f3ec" → pdf-lib colour; white when the string is not a hex colour. */
+function hexColor(hex: string | null) {
+  if (!hex || !/^#[0-9a-f]{6}$/i.test(hex)) return WHITE;
+  const n = parseInt(hex.slice(1), 16);
+  return rgb(((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255);
+}
+
+/**
+ * Table cell: one mask per source line, clipped to the cell interior (table
+ * rules and neighbouring cells stay untouched), in the cell's background colour.
+ */
+function drawCellMasks(page: PDFPage, block: TextBlock, cell: TableCellInfo, pageInfo: PageDebugInfo): number {
+  const [x0, y0, x1, y1] = pageInfo.view;
+  const boxes = block.lines.map((line) => {
+    const { top, bottom } = lineExtent(line);
+    return { x: line.x, right: line.x + line.width, top, bottom };
+  });
+  const color = hexColor(cell.background);
+  let drawn = 0;
+  for (const r of tableCellMaskRects(cell, boxes)) {
+    const left = clamp(r.x, x0, x1);
+    const right = clamp(r.x + r.width, x0, x1);
+    const lo = clamp(r.y, y0, y1);
+    const hi = clamp(r.y + r.height, y0, y1);
+    if (right - left <= 0 || hi - lo <= 0) continue;
+    page.drawRectangle({ x: left, y: lo, width: right - left, height: hi - lo, color, borderWidth: 0 });
+    drawn++;
+  }
+  return drawn;
+}
+
 function drawLineMask(page: PDFPage, line: TextLine, pageInfo: PageDebugInfo): boolean {
   const [x0, y0, x1, y1] = pageInfo.view;
   const { top, bottom } = lineExtent(line);
   const left = clamp(line.x - MASK_PAD_X, x0, x1);
   const right = clamp(line.x + line.width + MASK_PAD_X, x0, x1);
-  const lo = clamp(bottom - MASK_PAD_Y, y0, y1);
-  const hi = clamp(top + MASK_PAD_Y, y0, y1);
+  let lo = clamp(bottom - MASK_PAD_Y, y0, y1);
+  let hi = clamp(top + MASK_PAD_Y, y0, y1);
+  if (pageInfo.rules.length > 0) {
+    // A table border right under a caption / note sits inside the padding: leave it alone.
+    const clipped = clipMaskToRules({ x: left, y: lo, width: right - left, height: hi - lo }, line.y, line.fontSize, pageInfo.rules);
+    lo = clipped.y;
+    hi = clipped.y + clipped.height;
+  }
   if (right - left <= 0 || hi - lo <= 0) return false;
   page.drawRectangle({ x: left, y: lo, width: right - left, height: hi - lo, color: WHITE, borderWidth: 0 });
   return true;
@@ -450,14 +518,47 @@ function drawBlockText(
   return { drawn, clipped, error: null };
 }
 
+/** Debug PDF: table cells in orange (solid: source text box, dashed: usable rectangle). */
+function drawDebugCell(page: PDFPage, block: TextBlock, cell: TableCellInfo, labelFont: PDFFont): void {
+  const rect = (r: Rect, dashed: boolean) =>
+    page.drawRectangle({
+      x: r.x,
+      y: r.y,
+      width: Math.max(0.1, r.width),
+      height: Math.max(0.1, r.height),
+      borderColor: ORANGE,
+      borderWidth: dashed ? 0.4 : 0.6,
+      borderDashArray: dashed ? [1.5, 1.5] : undefined,
+      color: undefined,
+    });
+  rect(cell.usable, true);
+  rect(cell.textBox, false);
+  try {
+    page.drawText(`t${cell.tableId} r${cell.rowIndex}c${cell.columnIndex}${cell.numeric ? ' #' : ''}`, {
+      x: cell.usable.x + 0.5,
+      y: cell.usable.y + cell.usable.height - 3.5,
+      size: 3,
+      font: labelFont,
+      color: ORANGE,
+    });
+  } catch {
+    // labels are optional
+  }
+  void block;
+}
+
 function drawDebugPage(
   page: PDFPage,
   pageInfo: PageDebugInfo,
   units: readonly TranslationBlock[],
   blockById: ReadonlyMap<string, TextBlock>,
   labelFont: PDFFont,
+  cellBlocks: readonly TextBlock[] = [],
 ): void {
   const [, , , pageTop] = pageInfo.view;
+  for (const block of cellBlocks) {
+    if (block.cell && block.page === pageInfo.pageNumber) drawDebugCell(page, block, block.cell, labelFont);
+  }
   for (const img of foregroundImages(pageInfo)) {
     page.drawRectangle({
       x: img.x,
@@ -475,6 +576,7 @@ function drawDebugPage(
     for (const id of unit.sourceBlockIds) {
       const block = blockById.get(id);
       if (!block || block.page !== pageInfo.pageNumber || !isFiniteBox(block)) continue;
+      if (block.cell) continue; // drawn above in the table style
       if (eligible) {
         for (const line of block.lines) {
           const { top, bottom } = lineExtent(line);
@@ -533,6 +635,62 @@ interface UnitLayout {
   fallbackGlyphs: number;
   iterations: number;
   minFontSize: number;
+  /** Table cell: the table-only fit and where its lines go. */
+  table?: { fit: TableFitResult; placement: CellPlacement };
+}
+
+/**
+ * Table cell: fit into the cell's usable rectangle with the table-only rules
+ * (no downward extension, 5 pt floor). The width depends on the alignment:
+ * a left-aligned cell keeps its own left edge, a right-aligned one its right edge.
+ */
+function layoutTableCell(translation: string, block: TextBlock, cell: TableCellInfo, mixed: MixedFont): UnitLayout {
+  const { text, replaced } = sanitizeForFont(translation, mixed);
+  const usableRight = cell.usable.x + cell.usable.width;
+  const width =
+    cell.alignment === 'left'
+      ? usableRight - Math.max(cell.usable.x, cell.textBox.x)
+      : cell.alignment === 'right'
+        ? Math.min(usableRight, cell.textBox.x + cell.textBox.width) - cell.usable.x
+        : cell.usable.width;
+  const fit = fitTextToTableCell({
+    text,
+    width: Math.max(1, width),
+    height: cell.usable.height,
+    originalFontSize: cell.fontSize,
+    font: mixed,
+    trailingMarker: cell.trailingMarker,
+  });
+  const placement = placeTableCellLines(cell, fit, mixed);
+  return {
+    fontSize: fit.fontSize,
+    lineHeight: fit.lineHeight,
+    parts: new Map([[block.id, fit.lines]]),
+    fits: fit.fits,
+    extended: false,
+    overflow: fit.overflow,
+    replaced,
+    fallbackGlyphs: mixed.fallbackCount(text),
+    iterations: fit.iterations,
+    minFontSize: fit.minFontSize,
+    table: { fit, placement },
+  };
+}
+
+/** Draw the fitted lines of a table cell at their placed positions, plus the footnote marker. */
+function drawTableCellText(writer: PageTextWriter, placement: CellPlacement, fontSize: number, mixed: MixedFont): DrawTextOutcome {
+  let drawn = 0;
+  try {
+    for (const line of placement.lines) {
+      if (line.text.length > 0) writer.drawRuns(mixed.runs(line.text), line.x, line.y, fontSize);
+      drawn++;
+    }
+    const m = placement.marker;
+    if (m) writer.drawRuns(mixed.runs(m.text), m.x, m.y, m.fontSize);
+  } catch (err) {
+    return { drawn, clipped: 0, error: err instanceof Error ? err.message : String(err) };
+  }
+  return { drawn, clipped: 0, error: null };
 }
 
 /** Footnotes keep their marker: if the translation dropped "1 " / "* " / "¹ ", put the source's back. */
@@ -659,7 +817,12 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
     masksDrawn: 0,
     replacedChars: 0,
     fontFallbackCount: 0,
+    tableCells: 0,
+    tableCellsWritten: 0,
+    tableCellsOverflow: 0,
   };
+  /** Layout blocks that are logical table cells (for the debug PDF). */
+  const cellBlocks = layout.blocks.filter((b) => b.cell !== undefined);
 
   const skip = (unit: TranslationBlock, reason: string, message: string | null = null) => {
     if (reports.has(unit.id)) return;
@@ -692,8 +855,50 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         skip(unit, 'NO_TRANSLATION');
       } else {
         const sources = unit.sourceBlockIds.map((id) => blockById.get(id)).filter((b): b is TextBlock => !!b);
+        const cellBlock = sources.length === 1 ? sources[0] : null;
         try {
-          result = layoutUnit(unit, entry.translation, sources, pageById, mixed as MixedFont);
+          if (cellBlock?.cell) {
+            stats.tableCells++;
+            const cellLayout = layoutTableCell(entry.translation, cellBlock, cellBlock.cell, mixed as MixedFont);
+            if (cellLayout.fits) {
+              result = cellLayout;
+            } else {
+              // Table-only fallback: no downward extension, no clipping — the English cell stays.
+              const fit = cellLayout.table?.fit;
+              const cell = cellBlock.cell;
+              const reasonWord = fit?.reason === 'WIDTH' ? 'wider than the cell' : 'taller than the cell';
+              const message =
+                `translation is ${reasonWord} by ${cellLayout.overflow.toFixed(1)} pt even at ${cellLayout.fontSize} pt ` +
+                `(table ${cell.tableId}, row ${cell.rowIndex}, column ${cell.columnIndex}); English kept`;
+              reports.set(unit.id, {
+                unitId: unit.id,
+                sourceBlockIds: unit.sourceBlockIds,
+                page: unit.page,
+                type: unit.type,
+                cell: {
+                  tableId: cell.tableId,
+                  row: cell.rowIndex,
+                  column: cell.columnIndex,
+                  sourceText: cellBlock.text,
+                  finalFontSize: cellLayout.fontSize,
+                  overflowReason: fit?.reason ?? 'HEIGHT',
+                },
+                fontSize: cellBlock.fontSize,
+                finalFontSize: cellLayout.fontSize,
+                lines: cellLayout.parts.get(cellBlock.id)?.length ?? 0,
+                warning: true,
+                reason: 'TABLE_CELL_OVERFLOW',
+                message,
+                skipped: true,
+                fallbackGlyphs: 0,
+              });
+              stats.unitsSkipped++;
+              stats.tableCellsOverflow++;
+              console.warn(`[PDF Render Warning] block=${unit.id} reason=TABLE_CELL_OVERFLOW (${message})`);
+            }
+          } else {
+            result = layoutUnit(unit, entry.translation, sources, pageById, mixed as MixedFont);
+          }
         } catch (err) {
           skip(unit, 'FIT_FAILED', err instanceof Error ? err.message : String(err));
           console.warn(`[PDF Render Warning] block=${unit.id} reason=FIT_FAILED`, err);
@@ -743,12 +948,13 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
     if (shifted) target.pushOperators(pushGraphicsState(), concatTransformationMatrix(1, 0, 0, 1, dx, dy));
 
     if (mode === 'debug') {
-      drawDebugPage(target, pageInfo, pageUnits, blockById, labelFont as PDFFont);
+      drawDebugPage(target, pageInfo, pageUnits, blockById, labelFont as PDFFont, cellBlocks);
       if (shifted) target.pushOperators(popGraphicsState());
       return;
     }
 
     // Pass 1: masks for every line that will be rewritten on this page.
+    // Table cells: union of their source lines clipped to the cell interior.
     report('Masking original text...', pageNumber, pagesDone);
     const writable: TranslationBlock[] = [];
     for (const unit of pageUnits) {
@@ -757,6 +963,10 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
       for (const id of unit.sourceBlockIds) {
         const block = blockById.get(id);
         if (!block || block.page !== pageNumber) continue;
+        if (block.cell) {
+          stats.masksDrawn += drawCellMasks(target, block, block.cell, pageInfo);
+          continue;
+        }
         for (const line of block.lines) if (drawLineMask(target, line, pageInfo)) stats.masksDrawn++;
       }
     }
@@ -785,6 +995,20 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
           fallbackGlyphs: unitLayout.fallbackGlyphs,
         };
         const notes: string[] = [];
+        if (unitLayout.table && firstBlock?.cell) {
+          const cell = firstBlock.cell;
+          existing.cell = {
+            tableId: cell.tableId,
+            row: cell.rowIndex,
+            column: cell.columnIndex,
+            sourceText: firstBlock.text,
+            finalFontSize: unitLayout.fontSize,
+            overflowReason: null,
+          };
+          stats.tableCellsWritten++;
+          if (unitLayout.fontSize < cell.fontSize) notes.push(`table cell shrunk from ${cell.fontSize} pt to ${unitLayout.fontSize} pt`);
+          if (unitLayout.lineHeight < unitLayout.fontSize * 1.1) notes.push('tight table line height');
+        }
         if (!unitLayout.fits) {
           existing.warning = true;
           existing.reason = 'TEXT_OVERFLOW';
@@ -806,16 +1030,18 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         const block = blockById.get(id);
         if (!block || block.page !== pageNumber) continue;
         const lines = unitLayout.parts.get(id) ?? [];
-        const outcome = drawBlockText(
-          writer,
-          block,
-          pageInfo,
-          lines,
-          unitLayout.fontSize,
-          unitLayout.lineHeight,
-          mixed as MixedFont,
-          isCenteredBlock(block, pageInfo),
-        );
+        const outcome = unitLayout.table
+          ? drawTableCellText(writer, unitLayout.table.placement, unitLayout.fontSize, mixed as MixedFont)
+          : drawBlockText(
+              writer,
+              block,
+              pageInfo,
+              lines,
+              unitLayout.fontSize,
+              unitLayout.lineHeight,
+              mixed as MixedFont,
+              isCenteredBlock(block, pageInfo),
+            );
         if (outcome.error) {
           existing.warning = true;
           existing.reason = 'DRAW_FAILED';

@@ -56,6 +56,8 @@ export interface WorkerBlockInput {
   contextAfter?: string;
   /** Source looks cut off; the model must not invent the missing part. */
   incompleteSource?: boolean;
+  /** Block type for the short per-type guidance (TITLE, HEADING, CAPTION, ...); omitted for BODY. */
+  type?: string;
 }
 
 /** Provider token usage summed over the Worker's provider calls for one request. */
@@ -78,6 +80,47 @@ export interface WorkerTranslateResponse {
   model?: string;
   usage?: WorkerUsage;
   /** Provider calls made for this request (1, or 2 when the Worker retried missing ids). */
+  providerCalls?: number;
+}
+
+/** One auto-extracted glossary entry as the Worker returns it (validated again in terminology.ts). */
+export interface WorkerTermEntry {
+  source: string;
+  target: string;
+  abbreviation: string | null;
+}
+
+export interface WorkerTerminologyResponse {
+  terms: WorkerTermEntry[];
+  provider?: string;
+  model?: string;
+  usage?: WorkerUsage;
+}
+
+/** One block sent for the second-pass QA. */
+export interface WorkerQaItem {
+  id: string;
+  source: string;
+  translation: string;
+  type?: string;
+  /** Automatic warnings already detected for this block (may be empty). */
+  issues?: string[];
+}
+
+export interface WorkerQaVerdict {
+  id: string;
+  ok: boolean;
+  /** Corrected translation when ok is false, otherwise null. */
+  translation: string | null;
+  issues: string[];
+}
+
+export interface WorkerQaResponse {
+  blocks: WorkerQaVerdict[];
+  missing: string[];
+  provider?: string;
+  model?: string;
+  usage?: WorkerUsage;
   providerCalls?: number;
 }
 
@@ -213,8 +256,10 @@ export class TranslateClient {
     targetLanguage: string,
     terminology: Record<string, string> = {},
   ): Promise<WorkerTranslateResponse> {
+    const payload: Record<string, unknown> = { blocks, targetLanguage };
+    if (Object.keys(terminology).length > 0) payload.terminology = terminology;
     try {
-      const result = await this.translateOnce(blocks, targetLanguage, terminology);
+      const result = normalizeResponse(await this.post('/translate', payload));
       this.lastFailure = null;
       this.lastError = null;
       return result;
@@ -227,20 +272,31 @@ export class TranslateClient {
     }
   }
 
-  private async translateOnce(
-    blocks: WorkerBlockInput[],
-    targetLanguage: string,
-    terminology: Record<string, string>,
-  ): Promise<WorkerTranslateResponse> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+  /** POST /terminology: one call per document with text excerpts, never the whole paper. */
+  async extractTerminology(samples: string[]): Promise<WorkerTerminologyResponse> {
+    return normalizeTerminologyResponse(await this.post('/terminology', { samples, targetLanguage: 'zh-TW' }));
+  }
 
+  /** POST /qa: second-pass review of high-risk blocks (source + current translation). */
+  async reviewTranslations(
+    blocks: WorkerQaItem[],
+    targetLanguage: string,
+    terminology: Record<string, string> = {},
+  ): Promise<WorkerQaResponse> {
     const payload: Record<string, unknown> = { blocks, targetLanguage };
     if (Object.keys(terminology).length > 0) payload.terminology = terminology;
+    return normalizeQaResponse(await this.post('/qa', payload));
+  }
+
+  /** POST a JSON payload to a Worker route; every failure becomes a TranslateClientError. */
+  private async post(route: string, payload: Record<string, unknown>): Promise<unknown> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const url = `${this.baseUrl}${route}`;
 
     let response: Response;
     try {
-      response = await fetch(this.endpoint, {
+      response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...this.authHeaders() },
         body: JSON.stringify(payload),
@@ -255,7 +311,7 @@ export class TranslateClient {
       }
       throw new TranslateClientError(
         'network',
-        `Cannot reach the Worker at ${this.endpoint}. ` +
+        `Cannot reach the Worker at ${url}. ` +
           'Check that `wrangler dev` is running and that this origin is listed in ALLOWED_ORIGINS (CORS).',
         { retryable: true },
       );
@@ -275,7 +331,7 @@ export class TranslateClient {
     if (!response.ok) {
       const code = await readErrorCode(response);
       const requestId = requestIdOf(response);
-      noteFailure('/translate', response, code);
+      noteFailure(route, response, code);
       const common = { status: response.status, code, requestId };
 
       if (response.status === 429) {
@@ -297,14 +353,11 @@ export class TranslateClient {
       });
     }
 
-    let data: unknown;
     try {
-      data = await response.json();
+      return await response.json();
     } catch {
       throw new TranslateClientError('invalid_response', 'Worker returned a non-JSON body.', { retryable: true });
     }
-
-    return normalizeResponse(data);
   }
 }
 
@@ -345,6 +398,61 @@ function normalizeResponse(data: unknown): WorkerTranslateResponse {
     provider: typeof raw.provider === 'string' ? raw.provider : undefined,
     model: typeof raw.model === 'string' ? raw.model : undefined,
     usage,
+    providerCalls: typeof raw.providerCalls === 'number' ? raw.providerCalls : undefined,
+  };
+}
+
+function normalizeUsage(raw: unknown): WorkerUsage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const u = raw as { inputTokens?: unknown; outputTokens?: unknown; cachedInputTokens?: unknown };
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return { inputTokens: num(u.inputTokens), outputTokens: num(u.outputTokens), cachedInputTokens: num(u.cachedInputTokens) };
+}
+
+function normalizeTerminologyResponse(data: unknown): WorkerTerminologyResponse {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as { terms?: unknown }).terms)) {
+    throw new TranslateClientError('invalid_response', 'Worker response is missing a "terms" array.', { retryable: true });
+  }
+  const raw = data as { terms: unknown[]; provider?: unknown; model?: unknown; usage?: unknown };
+  const terms: WorkerTermEntry[] = [];
+  for (const entry of raw.terms) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as { source?: unknown; target?: unknown; abbreviation?: unknown };
+    if (typeof e.source !== 'string' || typeof e.target !== 'string') continue;
+    terms.push({ source: e.source, target: e.target, abbreviation: typeof e.abbreviation === 'string' ? e.abbreviation : null });
+  }
+  return {
+    terms,
+    provider: typeof raw.provider === 'string' ? raw.provider : undefined,
+    model: typeof raw.model === 'string' ? raw.model : undefined,
+    usage: normalizeUsage(raw.usage),
+  };
+}
+
+function normalizeQaResponse(data: unknown): WorkerQaResponse {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as { blocks?: unknown }).blocks)) {
+    throw new TranslateClientError('invalid_response', 'Worker response is missing a "blocks" array.', { retryable: true });
+  }
+  const raw = data as { blocks: unknown[]; missing?: unknown; provider?: unknown; model?: unknown; usage?: unknown; providerCalls?: unknown };
+  const blocks: WorkerQaVerdict[] = [];
+  for (const entry of raw.blocks) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as { id?: unknown; ok?: unknown; translation?: unknown; issues?: unknown };
+    if (typeof e.id !== 'string' || typeof e.ok !== 'boolean') continue;
+    blocks.push({
+      id: e.id,
+      ok: e.ok,
+      translation: typeof e.translation === 'string' ? e.translation : null,
+      issues: Array.isArray(e.issues) ? e.issues.filter((i): i is string => typeof i === 'string') : [],
+    });
+  }
+  const missing = Array.isArray(raw.missing) ? raw.missing.filter((m): m is string => typeof m === 'string') : [];
+  return {
+    blocks,
+    missing,
+    provider: typeof raw.provider === 'string' ? raw.provider : undefined,
+    model: typeof raw.model === 'string' ? raw.model : undefined,
+    usage: normalizeUsage(raw.usage),
     providerCalls: typeof raw.providerCalls === 'number' ? raw.providerCalls : undefined,
   };
 }

@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 // Public base path of the deployed site, set in ONE place:
 //   BASE_PATH env var at build time. The GitHub Pages workflow sets it from
@@ -21,5 +21,9 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: true,
+  },
+  test: {
+    // vitest runs in Node, where only the legacy PDF.js build works (DOMMatrix etc.).
+    alias: [{ find: /^pdfjs-dist$/, replacement: 'pdfjs-dist/legacy/build/pdf.mjs' }],
   },
 });
