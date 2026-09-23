@@ -11,10 +11,10 @@
  * AUTH_SECRET invalidates every issued token at once.
  */
 
+import { TOKEN_MAX_FUTURE_IAT_SECONDS, TOKEN_TTL_SECONDS } from './config';
 import type { Env } from './env';
 
-/** Session lifetime: 24 hours. */
-export const TOKEN_TTL_SECONDS = 24 * 60 * 60;
+export { TOKEN_TTL_SECONDS };
 /** Refuse to sign with a short, guessable AUTH_SECRET. */
 export const MIN_AUTH_SECRET_LENGTH = 32;
 /** Longer inputs are rejected without hashing. */
@@ -94,8 +94,10 @@ export async function createAuthToken(
 }
 
 /**
- * 1. signature (constant-time via crypto.subtle.verify), 2. payload shape, 3. expiration.
- * Returns the payload, or null for anything that is not a valid, unexpired token.
+ * 1. format (two base64url parts, 32-byte signature), 2. HMAC signature (constant-time
+ * via crypto.subtle.verify), 3. payload shape (v/iat/exp/sid), 4. exp > now, iat not in the
+ * future, lifetime <= TOKEN_TTL_SECONDS. Returns the payload, or null for anything else;
+ * callers answer every null with the same 401 so the reason is never revealed.
  */
 export async function verifyAuthToken(token: string, secret: string, nowMs = Date.now()): Promise<TokenPayload | null> {
   if (!token || !secret || token.length > 1024) return null;
@@ -116,11 +118,27 @@ export async function verifyAuthToken(token: string, secret: string, nowMs = Dat
   } catch {
     return null;
   }
-  if (payload.v !== 1 || typeof payload.exp !== 'number' || typeof payload.iat !== 'number' || typeof payload.sid !== 'string') {
-    return null;
-  }
-  if (payload.exp * 1000 <= nowMs) return null;
-  return payload as TokenPayload;
+  if (!isWellFormedPayload(payload)) return null;
+  const now = Math.floor(nowMs / 1000);
+  if (payload.exp <= now) return null; // expired
+  if (payload.iat > now + TOKEN_MAX_FUTURE_IAT_SECONDS) return null; // issued in the future
+  if (payload.exp <= payload.iat || payload.exp - payload.iat > TOKEN_TTL_SECONDS) return null; // impossible lifetime
+  return payload;
+}
+
+const SID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** v === 1, integer iat / exp, base64url sid. Anything else is treated as tampered. */
+function isWellFormedPayload(p: Partial<TokenPayload> | null): p is TokenPayload {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    p.v === 1 &&
+    Number.isInteger(p.iat) &&
+    Number.isInteger(p.exp) &&
+    typeof p.sid === 'string' &&
+    SID_PATTERN.test(p.sid)
+  );
 }
 
 /** `Authorization: Bearer <token>` → token, else null. */

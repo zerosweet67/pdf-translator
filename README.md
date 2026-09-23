@@ -243,6 +243,15 @@ POST /auth/verify
 
 `/translate` verifies the token before calling OpenAI.
 
+Worker routes (any other method answers `405` with an `Allow` header):
+
+```text
+GET  /health        → { "ok": true }            public liveness, nothing else
+GET  /auth/check    → session status + provider/model (needs a token)
+POST /auth/verify   → invite code → session token
+POST /translate     → text blocks → translations   (needs a token)
+```
+
 ## Production Deployment
 
 ### Cloudflare Worker
@@ -268,6 +277,8 @@ Deploy:
 ```powershell
 npx wrangler deploy
 ```
+
+The first deploy after the rate-limiting change also runs the Durable Object migration declared in `wrangler.toml` (`[[migrations]] tag = "v1"`, class `RateLimiterDO`, SQLite-backed so it works on the free plan). No KV namespace or other resource has to be created by hand; the deploy output should list `env.RATE_LIMITER (RateLimiterDO)` under bindings.
 
 Test:
 
@@ -350,7 +361,51 @@ npm run typecheck
 npm run build
 ```
 
-## Security Notes
+## Security
+
+The Worker is the only component that holds secrets and the only one that can spend OpenAI credit, so all hardening lives there. Nothing below changes the translation pipeline.
+
+- **Secrets** (`OPENAI_API_KEY`, `INVITE_CODE`, `AUTH_SECRET`) exist only as Cloudflare Worker secrets. The frontend bundle contains just the public Worker URL.
+- **Invite code check** is a constant-time comparison of SHA-256 digests; the response for a wrong code is `401 { "ok": false }` with no hint.
+- **Session tokens** are `base64url(payload).base64url(HMAC-SHA256(AUTH_SECRET, payload))`, valid for `TOKEN_TTL_SECONDS` (24 h, `worker/src/config.ts`). Verification checks format, signature length, HMAC, `v == 1`, integer `iat`/`exp`, a base64url `sid`, `exp > now`, `iat` not in the future and a lifetime of at most the TTL. Every failure is the same `401 { "error": "UNAUTHORIZED" }`.
+- **Browser storage**: the token lives in `sessionStorage` only (closing the tab ends the session) and is never put in a URL, the DOM, analytics or the Developer Mode panel.
+- **CORS**: an explicit origin allowlist (`ALLOWED_ORIGINS` in `wrangler.toml`), never `*`. Requests and preflights from any other origin get `403`. Allowed methods `GET, POST, OPTIONS`, allowed headers `Content-Type, Authorization`.
+- **Strict input**: `POST` routes require `Content-Type: application/json` (`415` otherwise). Bodies are capped (`4 KB` for `/auth/verify`, `512 KB` for `/translate`, checked on `Content-Length` and again while reading → `413`). `/translate` also enforces at most 50 blocks, 6 000 characters per block, 40 000 characters per request, 600-character contexts and 200 terminology entries.
+- **Security headers** on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Cache-Control: no-store`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`.
+- **Request ids**: every response carries `X-Request-ID`; the frontend prints it to the browser console on failures so a problem can be matched with the Worker log without exposing anything else.
+- **Safe errors**: users see one of a handful of generic messages (login expired / too many attempts / too many requests / file too large / service problem). Provider errors and stack traces stay in the Worker log.
+- **Logging**: security events are one-line `[Security] event=… route=… status=… requestId=… ipHash=…` entries. The IP appears only as a truncated keyed hash; tokens, the `Authorization` header, the invite code, secrets and translation text are never logged.
+
+### Rate Limiting
+
+Counters live in a Durable Object (`RATE_LIMITER` binding, class `RateLimiterDO`, one tiny object per key). A Durable Object handles requests one at a time, so "check, then count" is atomic and global, which Workers KV (eventually consistent, no atomic increment, one write per second per key) and in-memory maps (one per Worker instance) cannot provide. Only counters, window timestamps and random lease ids are stored; nothing about the PDF, the translation, the token or the invite code.
+
+| Limit | Key | Rule | Response |
+| --- | --- | --- | --- |
+| Invite attempts | `auth:<HMAC(ip)>` | 5 attempts / 60 s per `CF-Connecting-IP` | `429 { "error": "TOO_MANY_ATTEMPTS" }` |
+| Translate requests | `session:<sid>` | 20 requests / 60 s | `429 { "error": "RATE_LIMITED" }` |
+| Translate volume | `session:<sid>` | 250 000 source characters / 5 min | `429 { "error": "RATE_LIMITED" }` |
+| Concurrency | `session:<sid>` | at most 4 in-flight `/translate` requests (lease expires after 5 min if never released) | `429 { "error": "TOO_MANY_CONCURRENT_REQUESTS" }` |
+
+All windows are fixed windows; every `429` carries `Retry-After` and the frontend waits for it before retrying a batch. The frontend sends 3 batches in parallel and a typical PDF is 12–20 batches, so normal use stays under the limits. The numbers are in `worker/src/config.ts`.
+
+If the Durable Object cannot be reached, the Worker answers `503` rather than skipping the check. Without the binding (e.g. a misconfigured dev setup) it falls back to per-instance in-memory counters and logs `RATE_LIMIT_FALLBACK_MEMORY`; that fallback is not a production safeguard.
+
+### Secret Rotation
+
+If a session token may have leaked, rotate `AUTH_SECRET`; every issued token becomes invalid at once and users just re-enter the invite code:
+
+```powershell
+cd worker
+npx wrangler secret put AUTH_SECRET
+npx wrangler deploy
+```
+
+If the invite code leaked, rotate `INVITE_CODE` the same way. Note that changing `INVITE_CODE` does **not** invalidate sessions that were already issued (they stay valid until they expire, at most 24 h); rotate `AUTH_SECRET` as well if that matters.
+
+If `OPENAI_API_KEY` leaked, revoke it in the OpenAI dashboard first, then `npx wrangler secret put OPENAI_API_KEY`.
+
+If a real secret was ever committed, deleting it from the latest version is not enough. Rotate the secret immediately. Git history keeps every past version, and this project deliberately does not rewrite history.
 
 Never commit:
 
@@ -362,9 +417,31 @@ worker/.dev.vars
 *.secret
 ```
 
-If a real API key was ever committed to Git history, rotate it immediately.
-
 The repository can be public because the real secrets live in Cloudflare Worker secrets, not in the frontend.
+
+### Production Security Checklist
+
+- [ ] Worker secrets set: `OPENAI_API_KEY`, `INVITE_CODE`, `AUTH_SECRET` (`npx wrangler secret list` shows the names only)
+- [ ] `AUTH_SECRET` is at least 32 random characters (generator in *Local Development*)
+- [ ] Invite code is long and random (a passphrase or 20+ random characters), not a word
+- [ ] Repository contains no secrets: `git grep -nE "sk-[A-Za-z0-9]{8}|AUTH_SECRET=|INVITE_CODE=|OPENAI_API_KEY="` shows only placeholders
+- [ ] `ALLOWED_ORIGINS` in `worker/wrangler.toml` lists the real GitHub Pages origin (`https://<user>.github.io`, no path) and no wildcard
+- [ ] Rate-limit storage bound: `npx wrangler deploy` prints `env.RATE_LIMITER (RateLimiterDO)  Durable Object`
+- [ ] OpenAI usage limits configured in the OpenAI dashboard (monthly budget + alert)
+- [ ] `401` behaviour verified: `/translate` without a token answers `{ "error": "UNAUTHORIZED" }`
+- [ ] `429` behaviour verified: the 6th wrong invite code within a minute answers `TOO_MANY_ATTEMPTS`
+- [ ] `GET /health` answers only `{ "ok": true }`
+
+Quick production check from PowerShell (replace the URL):
+
+```powershell
+$w = "https://pdf-translator-worker.pdf-translator.workers.dev"
+curl.exe -s $w/health
+curl.exe -s -X POST $w/translate -H "Content-Type: application/json" -d "{}"
+1..6 | ForEach-Object { curl.exe -s -o NUL -w "%{http_code} " -X POST $w/auth/verify -H "Content-Type: application/json" -d '{"code":"wrong"}' }
+```
+
+Expected: `{"ok":true}`, `{"error":"UNAUTHORIZED"}`, then `401 401 401 401 401 429`.
 
 ## Known Limitations
 
@@ -375,7 +452,7 @@ The repository can be public because the real secrets live in Cloudflare Worker 
 - Table reconstruction is heuristic
 - Translation cache is in-memory only
 - Access control uses one shared invite code, not individual accounts
-- There is currently no per-user quota or server-side rate limit
+- Rate limits are per invite-code session and per source IP, not per person; users behind one shared IP share the 5-attempts-per-minute invite limit
 - Original English may remain searchable under white overlay masks in the generated PDF
 
 ## Fonts

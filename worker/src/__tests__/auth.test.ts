@@ -17,6 +17,7 @@ vi.mock('../providers', () => ({ createProvider: () => createProvider() }));
 import { createAuthToken, verifyAuthToken, TOKEN_TTL_SECONDS } from '../auth';
 import type { Env } from '../env';
 import worker from '../index';
+import { resetMemoryRateLimiter } from '../ratelimit';
 
 const PAGES_ORIGIN = 'https://alice.github.io';
 const ENV: Env = {
@@ -30,6 +31,7 @@ const BASE = 'https://worker.example';
 function call(path: string, init: RequestInit & { origin?: string | null; env?: Env } = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (init.origin !== null) headers.set('Origin', init.origin ?? 'http://localhost:5173');
+  headers.set('CF-Connecting-IP', '203.0.113.5');
   return worker.fetch(new Request(`${BASE}${path}`, { ...init, headers }), init.env ?? ENV);
 }
 
@@ -58,6 +60,7 @@ async function login(): Promise<string> {
 beforeEach(() => {
   providerTranslate.mockClear();
   createProvider.mockClear();
+  resetMemoryRateLimiter(); // ENV has no RATE_LIMITER binding: the in-memory fallback is used here
 });
 
 describe('POST /auth/verify', () => {
@@ -95,6 +98,7 @@ describe('POST /auth/verify', () => {
   it('fails closed when INVITE_CODE / AUTH_SECRET are not configured', async () => {
     const res = await call('/auth/verify', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code: 'anything' }),
       env: { ...ENV, AUTH_SECRET: 'too-short' },
     });
@@ -158,11 +162,11 @@ describe('POST /translate authorization', () => {
     expect((await call('/auth/check')).status).toBe(401);
   });
 
-  it('GET /health is public but only reveals provider details to a signed-in client', async () => {
+  it('GET /health is public and reveals only { ok: true }; provider details live on GET /auth/check', async () => {
     const anon = (await (await call('/health')).json()) as Record<string, unknown>;
     expect(anon).toEqual({ ok: true });
     const authed = (await (
-      await call('/health', { headers: { Authorization: `Bearer ${await login()}` } })
+      await call('/auth/check', { headers: { Authorization: `Bearer ${await login()}` } })
     ).json()) as Record<string, unknown>;
     expect(authed.ok).toBe(true);
     expect(authed.model).toBeDefined();
@@ -199,6 +203,7 @@ describe('CORS', () => {
 
   it('unknown origin is rejected and never gets a wildcard', async () => {
     const res = await preflight('https://evil.example');
+    expect(res.status).toBe(403);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBeNull();
     const post = await verify('friends-2026', 'https://evil.example');
     expect(post.status).toBe(403);
@@ -207,6 +212,7 @@ describe('CORS', () => {
 
   it('a look-alike host of the Pages origin does not match', async () => {
     const res = await preflight(`${PAGES_ORIGIN}.evil.example`);
+    expect(res.status).toBe(403);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
 });

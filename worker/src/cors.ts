@@ -23,9 +23,9 @@ export function buildCorsHeaders(origin: string | null, allowed: Set<string>): H
   headers.set('Vary', 'Origin');
   if (origin && isOriginAllowed(origin, allowed)) {
     headers.set('Access-Control-Allow-Origin', origin);
-    headers.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    headers.set('Access-Control-Expose-Headers', 'Retry-After');
+    headers.set('Access-Control-Expose-Headers', 'Retry-After, X-Request-ID');
     headers.set('Access-Control-Max-Age', '86400');
   }
   return headers;

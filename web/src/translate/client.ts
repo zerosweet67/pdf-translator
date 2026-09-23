@@ -4,23 +4,40 @@
  * Only JSON text blocks are ever sent. The PDF itself never leaves the browser.
  */
 
-export type TranslateErrorKind = 'network' | 'timeout' | 'rate_limit' | 'auth' | 'http' | 'invalid_response';
+export type TranslateErrorKind =
+  | 'network'
+  | 'timeout'
+  | 'rate_limit'
+  | 'auth'
+  | 'payload_too_large'
+  | 'http'
+  | 'invalid_response';
 
+/**
+ * Error surfaced to the UI. `message` is always written by this client (generic,
+ * never the Worker's or provider's raw text); `code` is the Worker's error code
+ * (e.g. RATE_LIMITED) and `requestId` the Worker's X-Request-ID for support/debugging.
+ * Neither ever contains the session token.
+ */
 export class TranslateClientError extends Error {
   readonly kind: TranslateErrorKind;
   readonly status: number | undefined;
+  readonly code: string | undefined;
+  readonly requestId: string | undefined;
   readonly retryAfterMs: number | undefined;
   readonly retryable: boolean;
 
   constructor(
     kind: TranslateErrorKind,
     message: string,
-    options: { status?: number; retryAfterMs?: number; retryable?: boolean } = {},
+    options: { status?: number; code?: string; requestId?: string; retryAfterMs?: number; retryable?: boolean } = {},
   ) {
     super(message);
     this.name = 'TranslateClientError';
     this.kind = kind;
     this.status = options.status;
+    this.code = options.code;
+    this.requestId = options.requestId;
     this.retryAfterMs = options.retryAfterMs;
     this.retryable = options.retryable ?? false;
   }
@@ -73,21 +90,30 @@ function parseRetryAfter(header: string | null): number | undefined {
   return undefined;
 }
 
-async function readErrorMessage(response: Response): Promise<string> {
+/** Worker error body: { error: "<CODE>", message?: "<generic hint>" }. */
+async function readErrorCode(response: Response): Promise<string | undefined> {
   try {
-    const data = (await response.json()) as { error?: { message?: string } | string };
+    const data = (await response.json()) as { error?: unknown };
     if (typeof data.error === 'string') return data.error;
-    if (data.error && typeof data.error.message === 'string') return data.error.message;
   } catch {
-    // ignore, fall through
+    // no JSON body
   }
-  return `${response.status} ${response.statusText}`.trim();
+  return undefined;
+}
+
+function requestIdOf(response: Response): string | undefined {
+  return response.headers.get('X-Request-ID') ?? undefined;
+}
+
+/** Console-only note for a failed Worker call: status, code and request id (never headers or tokens). */
+function noteFailure(route: string, response: Response, code: string | undefined): void {
+  console.warn(`[worker] ${route} → HTTP ${response.status}${code ? ` ${code}` : ''} (request id: ${requestIdOf(response) ?? 'n/a'})`);
 }
 
 /** Result of POST /auth/verify. The invite code itself is never stored. */
 export type InviteResult =
   | { ok: true; token: string; expiresAt: number }
-  | { ok: false; reason: 'invalid' | 'network' | 'server' };
+  | { ok: false; reason: 'invalid' | 'rate_limited' | 'network' | 'server' };
 
 export interface TranslateClientAuth {
   /** Current session token, sent as Authorization: Bearer. */
@@ -102,6 +128,8 @@ export class TranslateClient {
   private readonly auth: TranslateClientAuth | undefined;
   /** Kind of the most recent failed /translate call; cleared by a success. */
   lastFailure: TranslateErrorKind | null = null;
+  /** The most recent failed /translate call itself (for the user-facing message); cleared by a success. */
+  lastError: TranslateClientError | null = null;
 
   constructor(baseUrl: string, timeoutMs = 120_000, auth?: TranslateClientAuth) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
@@ -128,7 +156,14 @@ export class TranslateClient {
       return { ok: false, reason: 'network' };
     }
     if (res.status === 401 || res.status === 400) return { ok: false, reason: 'invalid' };
-    if (!res.ok) return { ok: false, reason: 'server' };
+    if (res.status === 429) {
+      noteFailure('/auth/verify', res, await readErrorCode(res));
+      return { ok: false, reason: 'rate_limited' };
+    }
+    if (!res.ok) {
+      noteFailure('/auth/verify', res, await readErrorCode(res));
+      return { ok: false, reason: 'server' };
+    }
     try {
       const data = (await res.json()) as { ok?: unknown; token?: unknown; expiresAt?: unknown };
       if (data.ok === true && typeof data.token === 'string' && typeof data.expiresAt === 'number') {
@@ -158,10 +193,14 @@ export class TranslateClient {
     return `${this.baseUrl}/translate`;
   }
 
-  /** GET /health → provider/model info, or null when the Worker is unreachable. */
-  async health(): Promise<{ provider?: string; model?: string; effort?: string } | null> {
+  /**
+   * Provider/model info for Developer Mode, or null when the Worker is unreachable or the
+   * session is invalid. GET /health is public and deliberately says nothing but { ok:true };
+   * the details come from the authenticated GET /auth/check.
+   */
+  async workerInfo(): Promise<{ provider?: string; model?: string; effort?: string } | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/health`, { headers: this.authHeaders(), signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`${this.baseUrl}/auth/check`, { headers: this.authHeaders(), signal: AbortSignal.timeout(5000) });
       if (!res.ok) return null;
       return (await res.json()) as { provider?: string; model?: string; effort?: string };
     } catch {
@@ -177,9 +216,13 @@ export class TranslateClient {
     try {
       const result = await this.translateOnce(blocks, targetLanguage, terminology);
       this.lastFailure = null;
+      this.lastError = null;
       return result;
     } catch (err) {
-      if (err instanceof TranslateClientError) this.lastFailure = err.kind;
+      if (err instanceof TranslateClientError) {
+        this.lastFailure = err.kind;
+        this.lastError = err;
+      }
       throw err;
     }
   }
@@ -222,22 +265,34 @@ export class TranslateClient {
     if (response.status === 401) {
       // Not retryable: the session is missing or expired; the UI asks for the invite code again.
       this.auth?.onUnauthorized?.();
-      throw new TranslateClientError('auth', 'Session expired or missing. Enter the invite code again.', { status: 401 });
-    }
-
-    if (response.status === 429) {
-      throw new TranslateClientError('rate_limit', 'Rate limited by the translation provider.', {
-        status: 429,
-        retryAfterMs: parseRetryAfter(response.headers.get('Retry-After')),
-        retryable: true,
+      throw new TranslateClientError('auth', 'Session expired or missing. Enter the invite code again.', {
+        status: 401,
+        code: 'UNAUTHORIZED',
+        requestId: requestIdOf(response),
       });
     }
 
     if (!response.ok) {
-      const message = await readErrorMessage(response);
+      const code = await readErrorCode(response);
+      const requestId = requestIdOf(response);
+      noteFailure('/translate', response, code);
+      const common = { status: response.status, code, requestId };
+
+      if (response.status === 429) {
+        // Worker per-session limit (RATE_LIMITED / TOO_MANY_CONCURRENT_REQUESTS) or the provider's
+        // own limit (PROVIDER_RATE_LIMITED): wait for Retry-After, then the batch is retried.
+        throw new TranslateClientError('rate_limit', 'Too many translation requests. Waiting before retrying.', {
+          ...common,
+          retryAfterMs: parseRetryAfter(response.headers.get('Retry-After')),
+          retryable: true,
+        });
+      }
+      if (response.status === 413) {
+        throw new TranslateClientError('payload_too_large', 'This batch is too large for the translation service.', common);
+      }
       const retryable = response.status >= 500 && response.status !== 501;
-      throw new TranslateClientError('http', `Worker error ${response.status}: ${message}`, {
-        status: response.status,
+      throw new TranslateClientError('http', `Translation service error (HTTP ${response.status}${code ? `, ${code}` : ''}).`, {
+        ...common,
         retryable,
       });
     }

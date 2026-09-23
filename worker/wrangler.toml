@@ -28,5 +28,18 @@ TRANSLATION_EFFORT = "low"
 #   site https://alice.github.io/pdf-translator/  →  origin https://alice.github.io
 ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,https://zerosweet67.github.io"
 
+# Rate limiting (auth attempts per IP, translate requests / characters / concurrency
+# per session) lives in a Durable Object: one tiny object per key, atomic counters,
+# no namespace to create by hand. Only counters and timestamps are stored, never
+# PDF text, translations, tokens or the invite code. First deploy after adding this
+# runs the migration automatically (`npx wrangler deploy`).
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
+
 [observability]
 enabled = true

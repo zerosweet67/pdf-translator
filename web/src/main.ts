@@ -331,7 +331,7 @@ async function isProbablyPdf(file: File): Promise<boolean> {
 
 async function refreshWorkerInfo(): Promise<void> {
   workerInfo.textContent = `Worker endpoint: ${client.endpoint} (checking...)`;
-  const health = await client.health();
+  const health = await client.workerInfo();
   if (!health) {
     workerInfo.textContent = `Worker endpoint: ${client.endpoint} — not reachable. Start \`wrangler dev\` in worker/.`;
     return;
@@ -349,6 +349,7 @@ async function refreshWorkerInfo(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const MSG_INVITE_INVALID = '邀請碼不正確';
+const MSG_INVITE_RATE_LIMITED = '嘗試次數過多，請稍後再試。';
 const MSG_SESSION_EXPIRED = '登入已過期，請重新輸入邀請碼。';
 const MSG_NETWORK = '目前無法連線至翻譯服務，請稍後再試。';
 
@@ -401,7 +402,10 @@ async function submitInvite(): Promise<void> {
       unlockApp();
       return;
     }
-    setText(inviteError, result.reason === 'invalid' ? MSG_INVITE_INVALID : MSG_NETWORK);
+    setText(
+      inviteError,
+      result.reason === 'invalid' ? MSG_INVITE_INVALID : result.reason === 'rate_limited' ? MSG_INVITE_RATE_LIMITED : MSG_NETWORK,
+    );
     if (result.reason === 'invalid') inviteInput.select();
   } finally {
     inviteSubmit.disabled = false;
@@ -1488,6 +1492,23 @@ const MSG_UNSUPPORTED = '目前只支援可選取文字的 PDF，掃描型 PDF �
 const MSG_READ_FAILED = '無法讀取這個 PDF，請確認檔案是否完整後再試一次。';
 const MSG_PASSWORD = '這個 PDF 有密碼保護，目前無法處理。';
 const MSG_TRANSLATE_FAILED = '翻譯服務暫時發生問題，請稍後再試。';
+const MSG_TRANSLATE_RATE_LIMITED = '翻譯請求過於頻繁，請稍後再試。';
+const MSG_PAYLOAD_TOO_LARGE = '文件內容過大，請改用較小的 PDF。';
+
+/** Why the whole translation step produced nothing, in words a user can act on (401 is handled by lockApp). */
+function translateFailureMessage(): string {
+  const err = client.lastError;
+  switch (err?.kind) {
+    case 'network':
+      return MSG_NETWORK;
+    case 'rate_limit':
+      return MSG_TRANSLATE_RATE_LIMITED;
+    case 'payload_too_large':
+      return MSG_PAYLOAD_TOO_LARGE;
+    default:
+      return MSG_TRANSLATE_FAILED; // 5xx, timeouts, invalid responses
+  }
+}
 const MSG_GENERATE_FAILED = 'PDF 產生失敗，請重新嘗試。';
 const MSG_OUT_OF_MEMORY = '這個 PDF 太大，瀏覽器記憶體不足，請關閉其他分頁後重新嘗試。';
 
@@ -1594,7 +1615,7 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
       if (e && (e.status === 'done' || e.status === 'cached') && e.translation) translated++;
     }
     console.log('[Translation]', Object.fromEntries(jobEntries));
-    if (translated === 0) throw new UserFacingError(client.lastFailure === 'network' ? MSG_NETWORK : MSG_TRANSLATE_FAILED);
+    if (translated === 0) throw new UserFacingError(translateFailureMessage());
 
     step = 'generate';
     setJobProgress('generate', 81, '正在產生中英對照 PDF...');
