@@ -16,7 +16,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 // `vite dev` and in the production bundle (respecting `base`). This is what
 // prevents the classic "works locally, worker 404 on GitHub Pages" problem.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import type { FilledRect, ImageBox, PageDebugInfo, PdfAnalysis, RuleLine, TextItemDebug } from './types';
+import type { FilledRect, FrameRect, ImageBox, PageDebugInfo, PdfAnalysis, RuleLine, TextItemDebug } from './types';
 import { normalizeSymbolFontText } from './symbols';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -66,6 +66,7 @@ export interface PageGraphics {
   images: ImageBox[];
   rules: RuleLine[];
   fills: FilledRect[];
+  frames: FrameRect[];
 }
 
 /** Thin straight paths up to this thickness (points) count as rules. */
@@ -74,8 +75,12 @@ const RULE_MAX_THICKNESS = 2.5;
 const RULE_MIN_LENGTH = 6;
 /** Filled rectangles smaller than this area (pt²) are ignored (bullets, icons). */
 const FILL_MIN_AREA = 40;
+/** A stroked rectangle counts as a frame (flowchart box, legend) from this size on. */
+const FRAME_MIN_SIDE = 8;
 /** Safety cap so a page made of thousands of tiny paths cannot blow up memory. */
 const MAX_GRAPHICS_PER_PAGE = 4000;
+/** A clipped shading covering more than this share of the page is a background wash, not a panel. */
+const SHADING_MAX_PAGE_SHARE = 0.9;
 
 /** Transform an axis-aligned box [minX, minY, maxX, maxY] by `ctm` and return the resulting bounding box. */
 function transformedBox(minMax: number[], ctm: Matrix): [number, number, number, number] {
@@ -97,6 +102,55 @@ function transformedBox(minMax: number[], ctm: Matrix): [number, number, number,
 function fillColorOf(args: unknown): string | null {
   if (Array.isArray(args) && typeof args[0] === 'string' && /^#[0-9a-f]{6}$/i.test(args[0])) return args[0].toLowerCase();
   return null;
+}
+
+/**
+ * The one colour an axial / radial shading paints, or null when it is a real
+ * gradient. Journals shade a table panel with an "axial" shading whose colour
+ * stops are all the same, which is a flat fill in everything but name; a
+ * mask over such a panel has to use that colour instead of white.
+ *
+ * PDF.js exposes the pattern as
+ * ["RadialAxial", type, matrix, [[offset, cssColor], ...], p0, p1, r0, r1].
+ */
+export function flatShadingColor(pattern: unknown): string | null {
+  if (!Array.isArray(pattern) || pattern[0] !== 'RadialAxial') return null;
+  const stops = pattern[3];
+  if (!Array.isArray(stops) || stops.length === 0) return null;
+  let color: string | null = null;
+  for (const stop of stops) {
+    if (!Array.isArray(stop) || typeof stop[1] !== 'string') return null;
+    const css = stop[1].toLowerCase();
+    if (css === 'transparent') continue;
+    if (!/^#[0-9a-f]{6}$/.test(css)) return null;
+    if (color === null) color = css;
+    else if (color !== css) return null; // a real gradient
+  }
+  return color;
+}
+
+/**
+ * True when the path is a single closed quadrilateral: four or five points,
+ * straight segments only. A stroked one is a box outline (flowchart node,
+ * legend frame), not an arrow or a polyline.
+ */
+function looksRectangular(data: unknown): boolean {
+  if (!Array.isArray(data) || data.length !== 1) return false;
+  const arr = data[0] as ArrayLike<number>;
+  let points = 0;
+  let i = 0;
+  while (i < arr.length) {
+    const op = arr[i];
+    if (op === 0 || op === 1) {
+      points++;
+      i += 3;
+    } else if (op === 4) {
+      i += 1;
+    } else {
+      return false;
+    }
+  }
+  return points >= 4 && points <= 5;
 }
 
 /** True when a path's draw ops describe straight segments only (no curves). */
@@ -121,7 +175,7 @@ function isStraightPath(data: unknown): boolean {
  * Tracks q/Q, cm and form XObjects; annotations are excluded. Charts drawn
  * with curves are ignored.
  */
-async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGraphics> {
+async function collectPageGraphics(page: pdfjsLib.PDFPageProxy, view: number[]): Promise<PageGraphics> {
   const OPS = pdfjsLib.OPS;
   const imageOps = new Set<number>(
     [
@@ -148,19 +202,26 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
   const boxes: ImageBox[] = [];
   const rules: RuleLine[] = [];
   const fills: FilledRect[] = [];
+  const frames: FrameRect[] = [];
   interface GState {
     ctm: Matrix;
     fill: string | null;
     lineWidth: number;
+    clip: FilledRect | null;
   }
   const stack: GState[] = [];
   let ctm: Matrix = [1, 0, 0, 1, 0, 0];
   let fillColor: string | null = null;
   let lineWidth = 1;
   let annotationDepth = 0;
+  /** Current clipping rectangle, null while nothing is clipped. */
+  let clip: FilledRect | null = null;
+  /** PDF.js emits `clip` first; the next path defines it. */
+  let pendingClip = false;
+  const pageArea = Math.max(1, (view[2] - view[0]) * (view[3] - view[1]));
 
   const addRuleOrFill = (paintOp: number, data: unknown, minMax: unknown) => {
-    if (annotationDepth > 0 || rules.length + fills.length >= MAX_GRAPHICS_PER_PAGE) return;
+    if (annotationDepth > 0 || rules.length + fills.length + frames.length >= MAX_GRAPHICS_PER_PAGE) return;
     // minMax is a Float32Array [minX, minY, maxX, maxY] in the path's own coordinate space.
     const mm = minMax as ArrayLike<number> | null;
     if (!mm || typeof mm !== 'object' || mm.length !== 4) return;
@@ -189,6 +250,10 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
     }
     if (filled && w * h >= FILL_MIN_AREA) {
       fills.push({ x: round(x0), y: round(y0), width: round(w), height: round(h), color: fillColor });
+      return;
+    }
+    if (stroked && w >= FRAME_MIN_SIDE && h >= FRAME_MIN_SIDE && looksRectangular(data)) {
+      frames.push({ x: round(x0), y: round(y0), width: round(w), height: round(h), thickness: round(thickness) });
     }
   };
 
@@ -198,6 +263,44 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
     ctm = g.ctm;
     fillColor = g.fill;
     lineWidth = g.lineWidth;
+    clip = g.clip;
+  };
+  const pushState = () => stack.push({ ctm, fill: fillColor, lineWidth, clip });
+
+  /** Narrow the clip to the path just constructed. */
+  const applyClip = (minMax: unknown) => {
+    pendingClip = false;
+    const mm = minMax as ArrayLike<number> | null;
+    if (!mm || typeof mm !== 'object' || mm.length !== 4) return;
+    const [x0, y0, x1, y1] = transformedBox([mm[0], mm[1], mm[2], mm[3]], ctm);
+    const next = { x: x0, y: y0, width: x1 - x0, height: y1 - y0, color: null };
+    if (!clip) {
+      clip = next;
+      return;
+    }
+    const nx = Math.max(clip.x, next.x);
+    const ny = Math.max(clip.y, next.y);
+    const nr = Math.min(clip.x + clip.width, next.x + next.width);
+    const nt = Math.min(clip.y + clip.height, next.y + next.height);
+    clip = { x: nx, y: ny, width: Math.max(0, nr - nx), height: Math.max(0, nt - ny), color: null };
+  };
+
+  /** A shading clipped to a rectangle, painted in one colour, is a flat panel. */
+  const addShading = (args: unknown) => {
+    if (annotationDepth > 0 || !clip || fills.length >= MAX_GRAPHICS_PER_PAGE) return;
+    if (clip.width <= 1 || clip.height <= 1) return;
+    if (clip.width * clip.height > SHADING_MAX_PAGE_SHARE * pageArea) return;
+    const id = Array.isArray(args) ? args[0] : null;
+    if (typeof id !== 'string') return;
+    let pattern: unknown = null;
+    try {
+      pattern = page.objs.has(id) ? page.objs.get(id) : null;
+    } catch {
+      pattern = null;
+    }
+    const color = flatShadingColor(pattern);
+    if (!color) return;
+    fills.push({ x: round(clip.x), y: round(clip.y), width: round(clip.width), height: round(clip.height), color });
   };
 
   for (let i = 0; i < opList.fnArray.length; i++) {
@@ -205,10 +308,17 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
     const args = opList.argsArray[i] as unknown;
     switch (fn) {
       case OPS.save:
-        stack.push({ ctm, fill: fillColor, lineWidth });
+        pushState();
         break;
       case OPS.restore:
         restoreState();
+        break;
+      case OPS.clip:
+      case OPS.eoClip:
+        pendingClip = true;
+        break;
+      case OPS.shadingFill:
+        addShading(args);
         break;
       case OPS.transform:
         if (isMatrix(args)) ctm = multiplyMatrix(args, ctm);
@@ -220,10 +330,13 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
         fillColor = fillColorOf(args);
         break;
       case OPS.constructPath:
-        if (Array.isArray(args) && typeof args[0] === 'number') addRuleOrFill(args[0], args[1], args[2]);
+        if (Array.isArray(args)) {
+          if (pendingClip) applyClip(args[2]);
+          if (typeof args[0] === 'number') addRuleOrFill(args[0], args[1], args[2]);
+        }
         break;
       case OPS.paintFormXObjectBegin: {
-        stack.push({ ctm, fill: fillColor, lineWidth });
+        pushState();
         const matrix = Array.isArray(args) ? (args as unknown[])[0] : null;
         if (isMatrix(matrix)) ctm = multiplyMatrix(matrix, ctm);
         break;
@@ -233,7 +346,7 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
         break;
       case OPS.beginAnnotation:
         annotationDepth++;
-        stack.push({ ctm, fill: fillColor, lineWidth });
+        pushState();
         break;
       case OPS.endAnnotation:
         annotationDepth = Math.max(0, annotationDepth - 1);
@@ -246,7 +359,7 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy): Promise<PageGra
         }
     }
   }
-  return { images: boxes, rules, fills };
+  return { images: boxes, rules, fills, frames };
 }
 
 // Derive the text item types from PDF.js itself so we do not depend on
@@ -377,9 +490,9 @@ export async function extractPdf(
       // Image placement for the overlay phase, table rules and fills for the
       // table renderer. Never fatal: a page whose operator list cannot be read
       // simply reports none.
-      let graphics: PageGraphics = { images: [], rules: [], fills: [] };
+      let graphics: PageGraphics = { images: [], rules: [], fills: [], frames: [] };
       try {
-        graphics = await collectPageGraphics(page);
+        graphics = await collectPageGraphics(page, page.view);
       } catch (err) {
         console.warn(`[extractPdf] image / rule detection failed on page ${pageNumber}:`, err);
       }
@@ -407,6 +520,7 @@ export async function extractPdf(
         images: graphics.images,
         rules: graphics.rules,
         fills: graphics.fills,
+        frames: graphics.frames,
       });
 
       page.cleanup();

@@ -58,6 +58,7 @@ function pages(n: number): PageDebugInfo[] {
     images: [],
     rules: [],
     fills: [],
+    frames: [],
   }));
 }
 

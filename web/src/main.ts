@@ -620,20 +620,25 @@ function describeLayout(layout: LayoutResult): string {
 }
 
 /**
- * Developer Mode: detected tables, logical cells, numeric cells kept in
- * English, and (after an export) the cells that overflowed and fell back to
- * English, with page / table / row / column / source text / final font size.
+ * Developer Mode: detected tables and figures, their logical cells, the
+ * numeric cells kept in English, and (after an export) the cells that
+ * overflowed and fell back to English, with page / table or figure / row /
+ * column / source text / final font size.
  */
 function renderTableDiagnostics(layout: LayoutResult, render: RenderResult | null): void {
   const st = layout.stats;
   const cellReports = render ? render.reports.filter((r) => r.cell) : [];
   const overflow = cellReports.filter((r) => r.reason === 'TABLE_CELL_OVERFLOW');
   const written = render ? render.stats.tableCellsWritten : 0;
+  const figureWritten = render ? render.stats.figureCellsWritten : 0;
+  const figureOverflow = cellReports.filter((r) => r.reason === 'FIGURE_CELL_OVERFLOW');
   tableDiagnosticsSummary.textContent =
-    `Table Diagnostics: ${st.tableCount} table(s) · ${st.tableCellCount} cells · ${st.tableTranslatedCells} translated · ` +
-    `${st.tableNumericCells} numeric preserved` +
+    `Tables: ${st.tableCount} · ${st.tableCellCount} cells · ${st.tableTranslatedCells} translated · ${st.tableNumericCells} numeric preserved` +
     (render ? ` · ${written} written · ${overflow.length} overflow → English` : '') +
-    (st.tableUnresolvedCount ? ` · ${st.tableUnresolvedCount} unresolved (kept in English)` : '');
+    (st.tableUnresolvedCount ? ` · ${st.tableUnresolvedCount} unresolved` : '') +
+    `  ||  Figures: ${st.figureCount} · ${st.figureCellCount} elements · ${st.figureTranslatedCells} translated · ${st.figureNumericCells} numeric preserved` +
+    (render ? ` · ${figureWritten} written · ${figureOverflow.length} overflow → English` : '') +
+    (st.figureUnresolvedCount ? ` · ${st.figureUnresolvedCount} unresolved` : '');
 
   const lines: string[] = [
     `detected tables:           ${st.tableCount}`,
@@ -645,6 +650,16 @@ function renderTableDiagnostics(layout: LayoutResult, render: RenderResult | nul
     render ? `overflow cells:            ${overflow.length}` : 'overflow cells:            —',
     render ? `fallback-to-English cells: ${overflow.length}` : 'fallback-to-English cells: —',
     '',
+    `detected figures:          ${st.figureCount}  (figure caption + vector cluster; other drawings keep their English)`,
+    `detected elements:         ${st.figureCellCount}`,
+    `translated elements:       ${st.figureTranslatedCells}`,
+    `numeric preserved:         ${st.figureNumericCells}`,
+    `unresolved figures:        ${st.figureUnresolvedCount}  (text could not be separated; kept in English)`,
+    render ? `elements written:          ${figureWritten}` : 'elements written:          — (generate a PDF)',
+    render ? `element overflow:          ${figureOverflow.length}` : 'element overflow:          —',
+    '',
+    `duplicate source items:    ${st.duplicateSourceItems}  (must be 0: no text item belongs to two units)`,
+    '',
     'tables:',
   ];
   for (const t of layout.tables) {
@@ -654,13 +669,24 @@ function renderTableDiagnostics(layout: LayoutResult, render: RenderResult | nul
         : `  page ${t.page}  table ${t.tableId}  UNRESOLVED (${t.reason}) — blocks kept in English`,
     );
   }
-  if (overflow.length) {
-    lines.push('', 'overflow cells (TABLE_CELL_OVERFLOW, English kept):');
-    for (const r of overflow) {
+  if (layout.figures.length) {
+    lines.push('', 'figures:');
+    for (const f of layout.figures) {
+      lines.push(
+        f.resolved
+          ? `  page ${f.page}  figure ${f.figureId}  ${f.containers} box container(s)  ${f.structured ? 'grid' : 'boxes + loose labels'}  ` +
+              `${f.textItems} text items → ${f.cells} elements  ${f.translatedCells} translated  ${f.numericCells} numeric`
+          : `  page ${f.page}  figure ${f.figureId}  UNRESOLVED (${f.reason}) — text kept in English`,
+      );
+    }
+  }
+  if (overflow.length || figureOverflow.length) {
+    lines.push('', 'overflow cells / elements (English kept):');
+    for (const r of [...overflow, ...figureOverflow]) {
       const c = r.cell;
       if (!c) continue;
       lines.push(
-        `  page ${r.page}  table ${c.tableId}  row ${c.row}  column ${c.column}  final font ${c.finalFontSize} pt  reason ${c.overflowReason}\n    source: ${c.sourceText}`,
+        `  page ${r.page}  ${c.kind} ${c.tableId}  row ${c.row}  column ${c.column}  final font ${c.finalFontSize} pt  reason ${c.overflowReason}\n    source: ${c.sourceText}`,
       );
     }
   }
@@ -673,9 +699,10 @@ function renderTableDiagnostics(layout: LayoutResult, render: RenderResult | nul
       const final = cellReports.find((r) => r.sourceBlockIds[0] === b.id)?.cell?.finalFontSize;
       const span = c.colSpan > 1 ? `–${c.columnIndex + c.colSpan - 1}` : '';
       lines.push(
-        `  ${c.id}  page ${c.page}  table ${c.tableId}  r${c.rowIndex} c${c.columnIndex}${span}  ${c.alignment}  ` +
+        `  ${c.id}  page ${c.page}  ${c.kind} ${c.tableId}  r${c.rowIndex} c${c.columnIndex}${span}  ${c.alignment}  ` +
           `${c.numeric ? 'numeric' : c.header ? 'header' : 'text'}  font ${c.fontSize}${final !== undefined ? ` → ${final}` : ''} pt  ` +
-          `bbox ${box(c.textBox)}  usable ${box(c.usable)}${c.trailingMarker ? `  marker ${c.trailingMarker}` : ''}${c.background ? `  bg ${c.background}` : ''}` +
+          `bbox ${box(c.textBox)}  usable ${box(c.usable)}${c.trailingMarker ? `  marker ${c.trailingMarker}` : ''}` +
+          `${c.background ? `  bg ${c.background}${c.textOnDark ? ' (white text)' : ''}` : c.maskable ? '' : '  NOT MASKABLE'}` +
           `  ${JSON.stringify(b.text.slice(0, 60))}`,
       );
     }
@@ -1496,7 +1523,7 @@ function updateExportUi(): void {
   generateBtn.disabled = isGenerating || (!debug && translated === 0);
   exportSummary.textContent =
     `${translated} / ${units.length} units translated · ${eligible} units eligible for overlay ` +
-    `(TITLE / HEADING / BODY / CAPTION / FOOTNOTE / TABLE without image overlap) · fonts: ${FONT_SOURCES.cjk.label} for Chinese, ` +
+    `(TITLE / HEADING / BODY / CAPTION / FOOTNOTE / TABLE / FIGURE without image overlap) · fonts: ${FONT_SOURCES.cjk.label} for Chinese, ` +
     `${FONT_SOURCES.latin.label} for Latin/digits, ${FONT_SOURCES.symbol.label} for symbols, fallback ${FONT_SOURCES.fallback.label}` +
     (bilingual
       ? ' · each output page = [ original page | translated page ], same height, double width'
@@ -1666,12 +1693,14 @@ async function runGenerate(): Promise<void> {
       renderStatus,
       mode === 'debug'
         ? `Debug PDF ready (${label}): ${s.pagesRendered} ${pagesWord} with bounding boxes in ${seconds}s. ` +
-            'Red = eligible block, blue = its lines, grey dashed = translated but not overlaid, green dashed = image, orange = table cell (dashed: usable area)' +
+            'Red = eligible block, blue = its lines, grey dashed = translated but not overlaid, green dashed = image, ' +
+            'orange = table cell, purple = figure element (dashed: usable area)' +
             (output === 'bilingual' ? '; boxes are drawn on the right half only.' : '.')
         : `Done (${label}, ${output === 'bilingual' ? 'side-by-side' : 'translated only'}) in ${seconds}s: ` +
             `${s.pagesRendered} ${pagesWord}, ${s.unitsWritten} unit(s) written, ${s.masksDrawn} lines masked, ` +
             `${s.unitsSkipped} unit(s) skipped, ${result.warnings.length} layout warning(s)` +
             (s.tableCells ? `, table cells ${s.tableCellsWritten} written / ${s.tableCellsOverflow} kept in English` : '') +
+            (s.figureCells ? `, figure elements ${s.figureCellsWritten} written / ${s.figureCellsOverflow} kept in English` : '') +
             (s.replacedChars ? `, ${s.replacedChars} character(s) not in any font` : '') +
             `. Fonts: ${result.fonts}; fallback glyphs: ${s.fontFallbackCount}.`,
     );

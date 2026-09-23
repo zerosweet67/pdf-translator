@@ -320,9 +320,51 @@ text items → baseline rows → fragments (wide gaps) → column bands
 - A table whose cells cannot be resolved (no column structure) keeps its
   blocks in English instead of overlaying them.
 
+### Figures (`web/src/pdf/figure.ts`)
+
+A vector diagram's text is not paragraphs either. A figure is resolved only
+when a **figure caption** and a **dense vector cluster** agree, which covers
+flowcharts, box-and-arrow diagrams and structured statistical figures such as
+forest plots; anything else keeps its English.
+
+```text
+fills / frames / rules → proximity cluster → nearest figure caption → region
+  → leaf boxes (filled or outlined) = text containers, one box = one unit
+  → loose text: a regular grid (forest plot) → the table cell clustering
+                otherwise → one unit per line, bounded by its neighbours
+```
+
+- Page furniture (a full-width rule in the top or bottom margin) never joins a
+  cluster, and a box that contains other boxes is a backdrop, not a container.
+- A block is absorbed only when it lies inside the cluster, is smaller than
+  the body font, is at most four lines, is not a caption, note, header or
+  footer, and does not already belong to a table. Absorption is whole blocks,
+  so `duplicateSourceItems` in the layout stats stays 0.
+- The caption and its wrapped second line keep the CAPTION pipeline.
+- Elements are masked, fitted and drawn by the same cell path as table cells:
+  no downward extension, 5 pt floor, English kept on overflow.
+- Numbers, `OR (95% CI)` and other pure statistical notation
+  (`isStatNotationOnly`) never reach the API. "No" and "Yes" do.
+- An element keeps its English when it cannot be masked safely: the
+  background is not one colour (several fills, or a raster image), or a
+  gridline, axis or connector runs through the glyphs.
+
+### Mask colour and text colour
+
+Masks are painted in the background they cover, not in white. The colour comes
+from the fills collected in `extract.ts`, including a clipped axial shading
+whose colour stops are all the same (how journals paint a table panel). It is
+sampled at the centre and four inset corners of the glyph box; if the samples
+disagree the text is left in English rather than masked in the wrong colour.
+The translation is then drawn black or white, whichever has the higher WCAG
+contrast on that background, so a dark box keeps its colour and gets white
+text instead of a white patch.
+
 Benchmark harness (no API calls): `TABLE_BENCH_PDF=<file> TABLE_BENCH_OUT=<dir>
 TABLE_BENCH_PAGES=6,7 npx vitest run src/pdf/__tests__/table.bench.test.ts`
-writes before / after / debug PDFs and `metrics.json`.
+writes before / after / debug PDFs and `metrics.json` for both tables and
+figures. The debug PDF outlines table cells in orange and figure elements in
+purple.
 
 ## Translation Cost Optimizations
 
@@ -577,6 +619,8 @@ Expected: `{"ok":true}`, `{"error":"UNAUTHORIZED"}`, then `401 401 401 401 401 4
 - Rotated pages / rotated text are not fully supported
 - Three-column layouts are not fully supported
 - Figure text embedded only as raster image is not translated
+- Figure text is only regrouped when a figure caption and a dense vector cluster agree; other drawings (and any element a gridline runs through, or whose background is not one flat colour) keep their English
+- Figure and table masks match a flat background colour only; a gradient or a raster background is not reproduced, and such text is left in English
 - Table reconstruction is heuristic: tables need a "Table N" caption; a wrapped header line that starts with a capital letter and has no continuation signal stays a separate cell; a translation that does not fit a cell even at 5 pt is left in English; a caption's translation may still grow downward over the first table rule (general block fitting)
 - Translation cache and the automatic glossary are in-memory only (per page session)
 - Numeric and citation checks are heuristic: a value the translator legitimately rewrites (e.g. "12 percent" → "百分之十二" in words) is reported as a warning and reviewed, and a wrong value that keeps the same digits (e.g. a swapped pair of identical numbers) is not detected

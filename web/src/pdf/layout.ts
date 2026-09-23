@@ -8,17 +8,21 @@
  */
 
 import { classifyBlocks, isAbbreviationOnly, isUntranslatableText } from './classify';
+import { buildFigureCells, detectFigureRegions, isUntranslatableFigureText, type FigureCaptionRef } from './figure';
 import { buildTranslationBlocks, contextStats } from './merge';
 import { buildTableCells, type ResolvedCell, type TableItemRef } from './table';
 import { joinLines } from './text';
 import type {
+  BlockType,
   ColumnLayout,
   ColumnRegion,
   DetailedBlockType,
+  FigureSummary,
   LayoutResult,
   PageDebugInfo,
   PageLayout,
   PdfAnalysis,
+  Rect,
   TableSummary,
   TextBlock,
   TextItemDebug,
@@ -412,9 +416,10 @@ function orderBlocks(blocks: TextBlock[], layout: ColumnLayout): TextBlock[] {
 // Step 5: table blocks → logical cells (see table.ts)
 // ---------------------------------------------------------------------------
 
-/** One TextBlock per logical cell, in place of the paragraph-style TABLE blocks classify.ts produced. */
+/** One TextBlock per logical cell, in place of the paragraph-style TABLE / figure blocks classify.ts produced. */
 function cellBlock(cell: ResolvedCell, template: TextBlock): TextBlock {
   const info = cell.info;
+  const figure = info.kind === 'figure';
   const lines: TextLine[] = cell.fragments.map((f) => ({
     page: template.page,
     text: f.text + (f.trailingMarker ?? ''),
@@ -432,17 +437,24 @@ function cellBlock(cell: ResolvedCell, template: TextBlock): TextBlock {
   let blockType: DetailedBlockType;
   let skipReason: string | null = null;
   if (info.numeric) {
-    blockType = 'TABLE_CELL';
+    blockType = figure ? 'FIGURE_LABEL' : 'TABLE_CELL';
     skipReason = 'NUMERIC_ONLY';
+  } else if (figure) {
+    blockType = 'FIGURE_LABEL';
+    if (isAbbreviationOnly(cell.text)) skipReason = 'ABBREVIATION_ONLY';
+    else if (isUntranslatableFigureText(cell.text)) skipReason = 'UNTRANSLATABLE';
+    else if (!info.maskable) skipReason = 'FIGURE_NOT_MASKABLE';
   } else {
     blockType = info.header ? 'TABLE_HEADER' : 'TABLE_TEXT_LABEL';
     if (isAbbreviationOnly(cell.text)) skipReason = 'ABBREVIATION_ONLY';
     else if (isUntranslatableText(cell.text)) skipReason = 'UNTRANSLATABLE';
+    else if (!info.maskable) skipReason = 'CELL_NOT_MASKABLE';
   }
+  const type: BlockType = figure ? 'FIGURE' : 'TABLE';
   return {
     id: info.id,
     page: template.page,
-    type: 'TABLE',
+    type,
     sectionType: template.sectionType,
     blockType,
     text: cell.text,
@@ -460,7 +472,8 @@ function cellBlock(cell: ResolvedCell, template: TextBlock): TextBlock {
     order: -1,
     translate: skipReason === null,
     skipReason,
-    tableId: info.tableId,
+    tableId: figure ? undefined : info.tableId,
+    figureId: figure ? info.tableId : undefined,
     cell: info,
   };
 }
@@ -576,6 +589,189 @@ function resolveTables(blocks: TextBlock[], analysis: PdfAnalysis): { blocks: Te
   return { blocks: out, tables };
 }
 
+/** Block types that always keep their own pipeline, whatever a figure region covers. */
+const FIGURE_EXCLUDED_TYPES: ReadonlySet<BlockType> = new Set(['HEADER', 'FOOTER', 'TITLE', 'AUTHOR', 'REFERENCE', 'CAPTION']);
+/** Captions and notes keep the CAPTION pipeline; they are never absorbed into their own figure. */
+const FIGURE_EXCLUDED_BLOCK_TYPES: ReadonlySet<DetailedBlockType> = new Set([
+  'FIGURE_CAPTION',
+  'FIGURE_NOTE',
+  'TABLE_CAPTION',
+  'TABLE_NOTE',
+]);
+/** A block inside a figure region is figure text when it is this much smaller than the body font... */
+const FIGURE_TEXT_MAX_FONT_RATIO = 0.95;
+/**
+ * Axis labels, tick labels and axis titles sit just outside the drawing's own
+ * ink, so membership is tested against the vector cluster grown by this much
+ * (points). The type, font-size and line-count filters keep body text out.
+ */
+const FIGURE_REGION_MARGIN = 20;
+/** A block in the caption's own font this close below / above it is the caption's second line, not figure text. */
+const CAPTION_CONTINUATION_FONT_TOLERANCE = 0.03;
+const CAPTION_CONTINUATION_LINES = 3;
+/** ...and no longer than this many lines (a real paragraph that overlaps the region stays a paragraph). */
+const FIGURE_TEXT_MAX_LINES = 4;
+
+function blockRect(b: TextBlock): Rect {
+  return { x: b.x, y: b.y, width: b.width, height: b.height };
+}
+
+/** The vector cluster plus the margin its labels live in. */
+function grown(r: Rect): Rect {
+  const m = FIGURE_REGION_MARGIN;
+  return { x: r.x - m, y: r.y - m, width: r.width + 2 * m, height: r.height + 2 * m };
+}
+
+/** Share of `b` that lies inside `region`. */
+function insideShare(b: TextBlock, region: Rect): number {
+  const r = blockRect(b);
+  const w = Math.min(r.x + r.width, region.x + region.width) - Math.max(r.x, region.x);
+  const h = Math.min(r.y + r.height, region.y + region.height) - Math.max(r.y, region.y);
+  if (w <= 0 || h <= 0) return 0;
+  const a = Math.max(1e-6, r.width * r.height);
+  return (w * h) / a;
+}
+
+/**
+ * Regroup the text of every detected figure into logical elements. A block is
+ * absorbed only when it lies inside the figure's vector cluster, is not a
+ * caption, note, header or footer, does not already belong to a table, and
+ * looks like figure text (small font, few lines). Absorption is whole blocks,
+ * so no source text item can end up in two units.
+ */
+function resolveFigures(
+  blocks: TextBlock[],
+  analysis: PdfAnalysis,
+  bodyFontSize: number,
+): { blocks: TextBlock[]; figures: FigureSummary[] } {
+  const itemIndex = new Map<TextItemDebug, number>();
+  analysis.items.forEach((item, i) => itemIndex.set(item, i));
+
+  const figures: FigureSummary[] = [];
+  const replacement = new Map<string, TextBlock[]>();
+  const absorbed = new Map<string, string>(); // block id → figure key
+  let figureId = 0;
+
+  for (const pageInfo of analysis.pages) {
+    const pageBlocks = blocks.filter((b) => b.page === pageInfo.pageNumber);
+    const captionBlocks = pageBlocks.filter((b) => b.blockType === 'FIGURE_CAPTION');
+    const captions: FigureCaptionRef[] = captionBlocks.map((b) => ({ id: b.id, box: blockRect(b) }));
+    if (captions.length === 0) continue;
+    const regions = detectFigureRegions(pageInfo, captions);
+
+    /** The caption's wrapped second line keeps the CAPTION pipeline, whatever the region covers. */
+    const continuesCaption = (b: TextBlock): boolean =>
+      captionBlocks.some((c) => {
+        if (Math.abs(b.fontSize - c.fontSize) > CAPTION_CONTINUATION_FONT_TOLERANCE * c.fontSize) return false;
+        const gap = b.y >= c.top ? b.y - c.top : c.y - b.top;
+        if (gap > CAPTION_CONTINUATION_LINES * c.fontSize) return false;
+        return Math.min(b.x + b.width, c.x + c.width) - Math.max(b.x, c.x) > 0;
+      });
+
+    for (const region of regions) {
+      const members = pageBlocks.filter((b) => {
+        if (absorbed.has(b.id) || b.tableId !== undefined || b.cell) return false;
+        if (FIGURE_EXCLUDED_TYPES.has(b.type) || FIGURE_EXCLUDED_BLOCK_TYPES.has(b.blockType)) return false;
+        if (continuesCaption(b)) return false;
+        if (insideShare(b, grown(region.bounds)) < 0.8) return false;
+        return b.fontSize <= FIGURE_TEXT_MAX_FONT_RATIO * bodyFontSize && b.lineCount <= FIGURE_TEXT_MAX_LINES;
+      });
+      if (members.length === 0) continue;
+
+      figureId++;
+      const key = `${pageInfo.pageNumber}:${figureId}`;
+      const items: TableItemRef[] = [];
+      for (const b of members) {
+        for (const line of b.lines) for (const item of line.items) items.push({ index: itemIndex.get(item) ?? -1, item });
+      }
+      const result = buildFigureCells({
+        page: pageInfo.pageNumber,
+        figureId,
+        region: grown(region.bounds),
+        items,
+        rules: pageInfo.rules,
+        fills: pageInfo.fills,
+        frames: pageInfo.frames,
+        images: pageInfo.images,
+      });
+
+      for (const b of members) absorbed.set(b.id, key);
+      if (result.ok) {
+        const cells = result.cells.map((c) => cellBlock(c, members[0]));
+        replacement.set(key, cells);
+        figures.push({
+          page: pageInfo.pageNumber,
+          figureId,
+          resolved: true,
+          containers: result.containers,
+          structured: result.structured,
+          cells: cells.length,
+          translatedCells: cells.filter((c) => c.translate).length,
+          numericCells: cells.filter((c) => c.cell?.numeric).length,
+          textItems: items.length,
+          reason: null,
+        });
+      } else {
+        for (const b of members) {
+          b.translate = false;
+          b.skipReason = `FIGURE_UNRESOLVED:${result.reason}`;
+        }
+        replacement.set(key, members);
+        figures.push({
+          page: pageInfo.pageNumber,
+          figureId,
+          resolved: false,
+          containers: 0,
+          structured: false,
+          cells: 0,
+          translatedCells: 0,
+          numericCells: 0,
+          textItems: items.length,
+          reason: result.reason,
+        });
+      }
+    }
+  }
+
+  if (figures.length === 0) return { blocks, figures };
+
+  const out: TextBlock[] = [];
+  const emitted = new Set<string>();
+  for (const b of blocks) {
+    const key = absorbed.get(b.id);
+    if (key !== undefined) {
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      out.push(...(replacement.get(key) ?? [b]));
+    } else {
+      out.push(b);
+    }
+  }
+  out.forEach((b, i) => {
+    b.order = i;
+  });
+  return { blocks: out, figures };
+}
+
+/**
+ * Source text items claimed by more than one block. Table and figure
+ * resolution absorb whole blocks, so this must always be 0; it is reported so
+ * a regression cannot silently translate and mask the same text twice.
+ */
+function countDuplicateSourceItems(blocks: readonly TextBlock[]): number {
+  const seen = new Set<TextItemDebug>();
+  let duplicates = 0;
+  for (const b of blocks) {
+    for (const line of b.lines) {
+      for (const item of line.items) {
+        if (seen.has(item)) duplicates++;
+        else seen.add(item);
+      }
+    }
+  }
+  return duplicates;
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -583,6 +779,8 @@ function resolveTables(blocks: TextBlock[], analysis: PdfAnalysis): { blocks: Te
 export interface LayoutOptions {
   /** Regroup TABLE blocks into logical cells (default true; false = the paragraph-style blocks, for A/B comparison). */
   resolveTables?: boolean;
+  /** Regroup the text of detected figures into logical elements (default true). */
+  resolveFigures?: boolean;
 }
 
 export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}): LayoutResult {
@@ -638,12 +836,17 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
   classifyBlocks(allBlocks, analysis.pages, bodyFontSize);
 
   const resolved = options.resolveTables === false ? { blocks: allBlocks, tables: [] } : resolveTables(allBlocks, analysis);
-  const finalBlocks = resolved.blocks;
+  const withFigures =
+    options.resolveFigures === false
+      ? { blocks: resolved.blocks, figures: [] }
+      : resolveFigures(resolved.blocks, analysis, bodyFontSize);
+  const finalBlocks = withFigures.blocks;
   const translationBlocks: TranslationBlock[] = buildTranslationBlocks(finalBlocks);
 
   const twoColumnPages = pageLayouts.filter((p) => p.layout === 'TWO_COLUMN').length;
   const context = contextStats(translationBlocks);
   const tables = resolved.tables;
+  const figures = withFigures.figures;
 
   return {
     bodyFontSize,
@@ -651,6 +854,7 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
     blocks: finalBlocks,
     translationBlocks,
     tables,
+    figures,
     stats: {
       lineCount,
       blockCount: finalBlocks.length,
@@ -665,6 +869,12 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
       tableTranslatedCells: tables.reduce((n, t) => n + t.translatedCells, 0),
       tableNumericCells: tables.reduce((n, t) => n + t.numericCells, 0),
       tableUnresolvedCount: tables.filter((t) => !t.resolved).length,
+      figureCount: figures.length,
+      figureCellCount: figures.reduce((n, f) => n + f.cells, 0),
+      figureTranslatedCells: figures.reduce((n, f) => n + f.translatedCells, 0),
+      figureNumericCells: figures.reduce((n, f) => n + f.numericCells, 0),
+      figureUnresolvedCount: figures.filter((f) => !f.resolved).length,
+      duplicateSourceItems: countDuplicateSourceItems(finalBlocks),
     },
   };
 }

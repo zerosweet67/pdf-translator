@@ -62,6 +62,16 @@ export interface RuleLine {
   thickness: number;
 }
 
+/** A stroked rectangle (a flowchart box, a legend frame), PDF user space. */
+export interface FrameRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Stroke width (points). */
+  thickness: number;
+}
+
 /** A filled rectangle (row shading, header background), PDF user space. */
 export interface FilledRect {
   x: number;
@@ -95,8 +105,10 @@ export interface PageDebugInfo {
    * list. Empty when detection failed or the page has none.
    */
   rules: RuleLine[];
-  /** Filled rectangles that may be table backgrounds (light colours only). */
+  /** Filled rectangles that may be table backgrounds or figure boxes. */
   fills: FilledRect[];
+  /** Stroked rectangles (outlined flowchart boxes, legend frames). */
+  frames: FrameRect[];
 }
 
 /** Result of analysing one PDF file. */
@@ -152,6 +164,7 @@ export type BlockType =
   | 'FOOTER'
   | 'REFERENCE'
   | 'TABLE'
+  | 'FIGURE'
   | 'OTHER';
 
 /**
@@ -180,6 +193,7 @@ export type DetailedBlockType =
   | 'TABLE_TEXT_LABEL'
   | 'TABLE_CELL'
   | 'TABLE_NOTE'
+  | 'FIGURE_LABEL'
   | 'SUPPLEMENTAL_HEADING'
   | 'SUPPLEMENTAL_BODY'
   | 'SUPPLEMENTAL_FOOTNOTE'
@@ -241,6 +255,8 @@ export interface TextBlock {
   skipReason: string | null;
   /** Table this block belongs to (per document, from the table caption), TABLE blocks only. */
   tableId?: number;
+  /** Figure this block belongs to (per document), FIGURE blocks only. */
+  figureId?: number;
   /**
    * Set when the block is one logical table cell (pdf/table.ts): the cell's
    * usable rectangle, position and alignment. Such a block is masked, fitted
@@ -261,13 +277,18 @@ export interface Rect {
 }
 
 /**
- * One logical table cell: every text item, line and footnote marker of that
- * cell merged into one translation unit (pdf/table.ts).
+ * One logical cell: every text item, line and footnote marker of one table
+ * cell (pdf/table.ts) or one figure text element (pdf/figure.ts) merged into
+ * a single translation unit. Both are masked, fitted and drawn by the
+ * cell path of the renderer, never by the paragraph path.
  */
 export interface TableCellInfo {
-  /** "p{page}-t{tableId}-r{row}c{col}". */
+  /** "p{page}-t{tableId}-r{row}c{col}" for a table, "p{page}-f{figureId}-..." for a figure. */
   id: string;
+  /** Table cell or figure text element. */
+  kind: 'table' | 'figure';
   page: number;
+  /** Table id, or figure id when `kind` is 'figure'. */
   tableId: number;
   rowIndex: number;
   columnIndex: number;
@@ -290,8 +311,35 @@ export interface TableCellInfo {
   header: boolean;
   /** Superscript footnote marker at the end of the cell ("d" of "Medicaid^d"), drawn back after the translation. */
   trailingMarker: string | null;
-  /** Fill colour behind the cell ("#f4f3ec"), null for plain paper. */
+  /** Fill colour behind the cell ("#f4f3ec"), null for plain paper (masked white). */
   background: string | null;
+  /**
+   * False when this text cannot be masked safely: its background could not be
+   * sampled reliably (several fills, or a raster image underneath), or a
+   * ruling line runs through the glyphs, so a mask would erase an axis,
+   * gridline or connector. Such a cell keeps its source text.
+   */
+  maskable: boolean;
+  /** True when the background is dark enough that the translation is drawn in white (WCAG contrast). */
+  textOnDark: boolean;
+}
+
+/** How one detected figure was resolved (Developer Mode figure diagnostics). */
+export interface FigureSummary {
+  page: number;
+  figureId: number;
+  /** False when no text element could be separated confidently; the figure stays English. */
+  resolved: boolean;
+  /** Text containers (filled or outlined boxes) found inside the figure. */
+  containers: number;
+  /** True when the loose text was resolved as a row/column grid (forest plot, structured figure). */
+  structured: boolean;
+  cells: number;
+  translatedCells: number;
+  numericCells: number;
+  /** Raw text items the figure owns. */
+  textItems: number;
+  reason: string | null;
 }
 
 /** Table diagnostics for Developer Mode (one entry per detected table). */
@@ -332,6 +380,8 @@ export interface LayoutResult {
   translationBlocks: TranslationBlock[];
   /** Detected tables (from table captions) and how their cells were resolved. */
   tables: TableSummary[];
+  /** Detected figures (caption + vector cluster) and how their text elements were resolved. */
+  figures: FigureSummary[];
   stats: {
     lineCount: number;
     blockCount: number;
@@ -359,6 +409,21 @@ export interface LayoutResult {
     tableNumericCells: number;
     /** Tables whose cells could not be resolved (kept in English). */
     tableUnresolvedCount: number;
+    /** Figures detected with high confidence (caption + vector cluster). */
+    figureCount: number;
+    /** Logical text elements over all resolved figures. */
+    figureCellCount: number;
+    figureTranslatedCells: number;
+    /** Numeric figure cells kept as they are (no API call). */
+    figureNumericCells: number;
+    /** Figures whose text could not be separated (kept in English). */
+    figureUnresolvedCount: number;
+    /**
+     * Source text items claimed by more than one block after tables and
+     * figures were resolved. Must be 0; a non-zero value means a text item
+     * would be translated (and masked) twice.
+     */
+    duplicateSourceItems: number;
   };
 }
 

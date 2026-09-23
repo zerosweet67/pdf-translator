@@ -25,7 +25,7 @@ import { isNumericOnly } from './classify';
 import { textExtent, tokenize, wrapTokens, type TextMeasurer } from './fit';
 import { GLYPH_ASCENT, GLYPH_DESCENT } from './layout';
 import { analyzeCompleteness, joinLines } from './text';
-import type { CellAlignment, FilledRect, Rect, RuleLine, TableCellInfo, TextItemDebug } from './types';
+import type { CellAlignment, FilledRect, ImageBox, Rect, RuleLine, TableCellInfo, TextItemDebug } from './types';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -34,7 +34,14 @@ import type { CellAlignment, FilledRect, Rect, RuleLine, TableCellInfo, TextItem
 /** Items whose baselines differ by less than this × fontSize share a row. */
 const ROW_BASELINE_TOLERANCE = 0.5;
 /** A horizontal gap above this × row font size separates two fragments (cells) on one row. */
-const FRAGMENT_GAP = 0.75;
+export const FRAGMENT_GAP = 0.75;
+/**
+ * A fragment that covers several columns is split again at an internal item
+ * gap of at least this × font size that falls in a gutter between two column
+ * bands. Wider than a word space (~0.25 em), so running text is never split;
+ * this is what keeps a long row label out of its neighbouring numeric column.
+ */
+const RESPLIT_GAP = 0.4;
 /** A gap wider than this × fontSize between items becomes a space. */
 const WORD_GAP = 0.12;
 /** Column bands are separated by an empty x-gap at least this wide (points, or × font size). */
@@ -62,12 +69,11 @@ const OPEN_SIDE_ROOM = 0.3;
 /** Mask padding around each source line (points), before clipping to the cell interior. */
 export const TABLE_MASK_PAD = 0.5;
 /**
- * A fill is reused as the mask colour only when black text stays readable on
- * it: every channel at least this (0–255) and relative luminance at least
- * BACKGROUND_MIN_LUMINANCE. Darker fills (a black header bar) get a white mask.
+ * Minimum WCAG contrast ratio between the translated text and the background
+ * it is drawn on. Every solid colour reaches at least 4.58 with either black
+ * or white text, so this only rejects a background we could not read.
  */
-const BACKGROUND_MIN_CHANNEL = 0x60;
-const BACKGROUND_MIN_LUMINANCE = 0.45;
+export const MIN_CONTRAST_RATIO = 4.5;
 
 /** Table-only fitting: starting line height, tighter fallback, font step and floor. */
 export const TABLE_LINE_HEIGHT_RATIO = 1.15;
@@ -106,6 +112,38 @@ export function isNumericTableCell(text: string): boolean {
   if (stripped !== t && stripped.length > 0 && isNumericOnly(stripped)) return true;
   if (NUMBER_WITH_UNIT_RE.test(t)) return true;
   return false;
+}
+
+/**
+ * Abbreviations that stay as they are in a table cell or a figure label:
+ * effect measures, dispersion, intervals, counts and test statistics. They
+ * only count when written in capitals, so the flowchart answer "No" is not
+ * mistaken for the count abbreviation "No.".
+ */
+const STAT_TOKENS = new Set([
+  'OR', 'HR', 'RR', 'IRR', 'AOR', 'AHR', 'ARR', 'CI', 'CRI', 'SD', 'SE', 'SEM', 'IQR',
+  'N', 'NO', 'NOS', 'P', 'DF', 'Z', 'T', 'F', 'R', 'R2', 'AUC', 'ROC', 'MD', 'SMD', 'RD', 'NNT',
+  'REF', 'NA', 'NS',
+]);
+/** The same abbreviations as they are also written in lower case, plus the adjusted-estimate forms. */
+const STAT_TOKENS_LOWER = new Set(['n', 'p', 'z', 't', 'r', 'df', 'vs', 'ns']);
+const STAT_TOKENS_MIXED = new Set(['aOR', 'aHR', 'aRR', 'aIRR']);
+
+/**
+ * A cell that is only statistical notation, numbers and punctuation, such as
+ * "OR (95% CI)", "HR (95% CI)" or "SD": translating it would only damage it,
+ * so it never reaches the API. A cell with any ordinary word ("Odds ratio
+ * (95% CI)", "Variable", "No", "Yes") is translated normally.
+ */
+export function isStatNotationOnly(text: string): boolean {
+  const words = text.match(/[A-Za-zµμ][A-Za-z0-9µμ]*/g);
+  if (!words || words.length === 0) return false;
+  for (const w of words) {
+    if (w === w.toUpperCase() && STAT_TOKENS.has(w)) continue;
+    if (STAT_TOKENS_LOWER.has(w) || STAT_TOKENS_MIXED.has(w)) continue;
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +212,12 @@ export interface TableInput {
   items: TableItemRef[];
   rules: readonly RuleLine[];
   fills: readonly FilledRect[];
+  /** Raster images, so a cell over one is reported as an unreliable background. */
+  images?: readonly ImageBox[];
+  /** Cell id prefix; defaults to "p{page}-t{tableId}". */
+  idPrefix?: string;
+  /** 'table' (default) or 'figure' for a structured figure resolved as a grid. */
+  kind?: 'table' | 'figure';
 }
 
 export type TableBuildResult =
@@ -294,7 +338,7 @@ function makeFragment(refs: TableItemRef[], rowIndex: number, rowY: number, rowF
   };
 }
 
-function buildRows(refs: readonly TableItemRef[]): Row[] {
+function buildRows(refs: readonly TableItemRef[], fragmentGap = FRAGMENT_GAP): Row[] {
   const rows: Row[] = [];
   clusterRows(refs).forEach((cluster, index) => {
     const items = cluster.map((r) => r.item);
@@ -307,7 +351,7 @@ function buildRows(refs: readonly TableItemRef[]): Row[] {
     let runRight = -Infinity;
     for (const ref of byX) {
       const gap = ref.item.x - runRight;
-      if (run.length > 0 && gap > FRAGMENT_GAP * rowFs) {
+      if (run.length > 0 && gap > fragmentGap * rowFs) {
         fragments.push(makeFragment(run, index, rowY, rowFs));
         run = [];
       }
@@ -318,6 +362,15 @@ function buildRows(refs: readonly TableItemRef[]): Row[] {
     rows.push({ index, y: rowY, fontSize: rowFs, fragments });
   });
   return rows;
+}
+
+/**
+ * Text lines of `refs`, top to bottom: items on one baseline that are not
+ * separated by a wide gap form one fragment. No column model, no merging of
+ * wrapped lines; used for the text inside one figure box (pdf/figure.ts).
+ */
+export function buildTextFragments(refs: readonly TableItemRef[], fragmentGap = FRAGMENT_GAP): Fragment[] {
+  return buildRows(refs, fragmentGap).flatMap((r) => r.fragments);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +431,38 @@ function assignColumns(fragment: Fragment, bands: readonly Band[]): void {
   }
   fragment.colStart = first;
   fragment.colEnd = last;
+}
+
+/**
+ * A fragment that reaches across a gutter is split again when its items have
+ * a real gap there: a long row label followed by its numeric column, which a
+ * single wide-gap pass leaves joined. A spanning header is continuous text
+ * with no such gap, so it survives untouched.
+ */
+function resplitAtGutters(fragment: Fragment, bands: readonly Band[], row: Row): Fragment[] {
+  if (fragment.items.length < 2) return [fragment];
+  const gutters: Array<{ lo: number; hi: number }> = [];
+  for (let c = 1; c < bands.length; c++) gutters.push({ lo: bands[c - 1].right, hi: bands[c].left });
+  if (gutters.length === 0) return [fragment];
+
+  const sorted = [...fragment.items].sort((a, b) => a.item.x - b.item.x);
+  const pieces: TableItemRef[][] = [];
+  let current: TableItemRef[] = [sorted[0]];
+  let right = sorted[0].item.x + sorted[0].item.width;
+  for (let i = 1; i < sorted.length; i++) {
+    const it = sorted[i].item;
+    const gap = it.x - right;
+    const inGutter = gutters.some((g) => right <= g.hi + 0.5 && it.x >= g.lo - 0.5);
+    if (gap >= RESPLIT_GAP * row.fontSize && inGutter) {
+      pieces.push(current);
+      current = [];
+    }
+    current.push(sorted[i]);
+    right = Math.max(right, it.x + it.width);
+  }
+  pieces.push(current);
+  if (pieces.length < 2) return [fragment];
+  return pieces.map((p) => makeFragment(p, row.index, row.y, row.fontSize));
 }
 
 /** Fragments of one row that landed in the same column range are one visual line (over-split by a wide word gap). */
@@ -665,30 +750,87 @@ function alignmentOf(values: { x: number; right: number }[]): CellAlignment {
   return 'right';
 }
 
-function hexChannelsLight(color: string): boolean {
-  const n = parseInt(color.slice(1), 16);
-  if (!Number.isFinite(n)) return false;
-  const r = (n >> 16) & 0xff;
-  const g = (n >> 8) & 0xff;
-  const b = n & 0xff;
-  if (r < BACKGROUND_MIN_CHANNEL || g < BACKGROUND_MIN_CHANNEL || b < BACKGROUND_MIN_CHANNEL) return false;
-  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 >= BACKGROUND_MIN_LUMINANCE;
+/** WCAG relative luminance of a "#rrggbb" colour (0 = black, 1 = white). */
+export function relativeLuminance(hex: string): number {
+  const n = parseInt(hex.slice(1), 16);
+  if (!Number.isFinite(n)) return 1;
+  const channel = (v: number): number => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel((n >> 16) & 0xff) + 0.7152 * channel((n >> 8) & 0xff) + 0.0722 * channel(n & 0xff);
 }
 
-/** Light fill behind the centre of `box`, or null (white and unknown colours are null). */
-export function backgroundAt(box: Rect, fills: readonly FilledRect[]): string | null {
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
+/** WCAG contrast ratio between two relative luminances. */
+export function contrastRatio(a: number, b: number): number {
+  const hi = Math.max(a, b);
+  const lo = Math.min(a, b);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/**
+ * Black or white text on `background` (null = paper), whichever has the
+ * higher WCAG contrast. Null when neither reaches MIN_CONTRAST_RATIO, which
+ * tells the caller to keep the source text instead of drawing something
+ * unreadable.
+ */
+export function textColorFor(background: string | null): 'dark' | 'light' | null {
+  if (background === null) return 'dark';
+  const l = relativeLuminance(background);
+  const onDark = contrastRatio(l, 0);
+  const onLight = contrastRatio(l, 1);
+  const best = Math.max(onDark, onLight);
+  if (best < MIN_CONTRAST_RATIO) return null;
+  return onDark >= onLight ? 'dark' : 'light';
+}
+
+export interface BackgroundSample {
+  /** Fill colour under the whole box, null for plain paper. */
+  color: string | null;
+  /** True when the box straddles different fills or a raster image: the mask colour is not reliable. */
+  ambiguous: boolean;
+}
+
+/** Topmost fill covering `point`, null when only paper (or white) is there. */
+function fillAt(x: number, y: number, fills: readonly FilledRect[]): string | null {
   let found: string | null = null;
   for (const f of fills) {
-    if (cx < f.x || cx > f.x + f.width || cy < f.y || cy > f.y + f.height) continue;
-    if (!f.color || f.color === '#ffffff' || !hexChannelsLight(f.color)) {
-      found = null; // a later paint covers earlier ones
-      continue;
-    }
-    found = f.color;
+    if (x < f.x || x > f.x + f.width || y < f.y || y > f.y + f.height) continue;
+    found = !f.color || f.color === '#ffffff' ? null : f.color;
   }
   return found;
+}
+
+/**
+ * The background behind `box`, sampled at its centre and four inset corners.
+ * One colour everywhere means the mask can use it; different colours, or a
+ * raster image underneath, mean the caller cannot mask safely.
+ */
+export function sampleBackground(box: Rect, fills: readonly FilledRect[], images: readonly ImageBox[] = []): BackgroundSample {
+  const ix = Math.min(0.15 * box.width, 1.5);
+  const iy = Math.min(0.15 * box.height, 1.5);
+  const points: Array<[number, number]> = [
+    [box.x + box.width / 2, box.y + box.height / 2],
+    [box.x + ix, box.y + iy],
+    [box.x + box.width - ix, box.y + iy],
+    [box.x + ix, box.y + box.height - iy],
+    [box.x + box.width - ix, box.y + box.height - iy],
+  ];
+  for (const img of images) {
+    if (box.x < img.x + img.width && box.x + box.width > img.x && box.y < img.y + img.height && box.y + box.height > img.y) {
+      return { color: null, ambiguous: true };
+    }
+  }
+  const first = fillAt(points[0][0], points[0][1], fills);
+  for (const [x, y] of points.slice(1)) {
+    if (fillAt(x, y, fills) !== first) return { color: first, ambiguous: true };
+  }
+  return { color: first, ambiguous: false };
+}
+
+/** Fill behind the centre of `box`, or null for plain paper. */
+export function backgroundAt(box: Rect, fills: readonly FilledRect[]): string | null {
+  return sampleBackground(box, fills).color;
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +847,7 @@ export function buildTableCells(input: TableInput): TableBuildResult {
   if (bands.length < 2) return { ok: false, reason: 'NO_COLUMNS' };
 
   for (const row of rows) {
+    row.fragments = row.fragments.flatMap((f) => resplitAtGutters(f, bands, row));
     for (const f of row.fragments) assignColumns(f, bands);
     mergeSameColumn(row);
   }
@@ -742,16 +885,19 @@ export function buildTableCells(input: TableInput): TableBuildResult {
     };
     const spanning = draft.colEnd > draft.colStart;
     const header = draft.rows[0] < firstDataRow;
-    const baseId = `p${input.page}-t${input.tableId}-r${draft.rows[0]}c${draft.colStart}`;
+    const prefix = input.idPrefix ?? `p${input.page}-t${input.tableId}`;
+    const baseId = `${prefix}-r${draft.rows[0]}c${draft.colStart}`;
     const seen = usedIds.get(baseId) ?? 0;
     usedIds.set(baseId, seen + 1);
     const id = seen === 0 ? baseId : `${baseId}-${seen + 1}`;
     const text = draft.text.replace(/\s+/g, ' ').trim();
+    const background = sampleBackground(textBox, input.fills, input.images ?? []);
     cells.push({
       text,
       fragments: draft.fragments,
       info: {
         id,
+        kind: input.kind ?? 'table',
         page: input.page,
         tableId: input.tableId,
         rowIndex: draft.rows[0],
@@ -762,10 +908,12 @@ export function buildTableCells(input: TableInput): TableBuildResult {
         usable,
         alignment: spanning && header ? 'center' : alignments[draft.colStart],
         fontSize,
-        numeric: isNumericTableCell(text),
+        numeric: isNumericTableCell(text) || isStatNotationOnly(text),
         header,
         trailingMarker: draft.trailingMarker,
-        background: backgroundAt(textBox, input.fills),
+        background: background.ambiguous ? null : background.color,
+        maskable: !background.ambiguous,
+        textOnDark: !background.ambiguous && textColorFor(background.color) === 'light',
       },
     });
   }
@@ -837,6 +985,33 @@ export function clipMaskToRules(mask: Rect, baseline: number, fontSize: number, 
     }
   }
   return { x: mask.x, y: lo, width: mask.width, height: Math.max(0, hi - lo) };
+}
+
+/**
+ * Pull a mask off any ruling line that only reaches into its padding: table
+ * borders, flowchart box outlines, connectors and axis lines survive. Only an
+ * edge zone is trimmed, so a rule drawn through the glyphs themselves (an
+ * underline) still gets covered and no source text is left showing.
+ */
+export function clipMaskOffRules(mask: Rect, rules: readonly RuleLine[], clearance = BORDER_CLEARANCE): Rect {
+  const zone = TABLE_MASK_PAD + clearance;
+  let left = mask.x;
+  let right = mask.x + mask.width;
+  let lo = mask.y;
+  let hi = mask.y + mask.height;
+  for (const r of rules) {
+    const half = r.thickness / 2;
+    if (r.orientation === 'horizontal') {
+      if (r.x1 <= left || r.x0 >= right) continue;
+      if (r.y0 >= lo - clearance && r.y0 <= lo + zone) lo = Math.max(lo, r.y0 + half + clearance);
+      if (r.y0 <= hi + clearance && r.y0 >= hi - zone) hi = Math.min(hi, r.y0 - half - clearance);
+    } else {
+      if (r.y1 <= lo || r.y0 >= hi) continue;
+      if (r.x0 >= left - clearance && r.x0 <= left + zone) left = Math.max(left, r.x0 + half + clearance);
+      if (r.x0 <= right + clearance && r.x0 >= right - zone) right = Math.min(right, r.x0 - half - clearance);
+    }
+  }
+  return { x: left, y: lo, width: Math.max(0, right - left), height: Math.max(0, hi - lo) };
 }
 
 // ---------------------------------------------------------------------------

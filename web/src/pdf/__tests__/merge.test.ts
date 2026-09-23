@@ -20,7 +20,7 @@ function block(spec: Spec): TextBlock {
     page: spec.page,
     type,
     sectionType: 'MAIN',
-    blockType: type === 'TABLE' ? 'TABLE_TEXT_LABEL' : type,
+    blockType: type === 'TABLE' ? 'TABLE_TEXT_LABEL' : type === 'FIGURE' ? 'FIGURE_LABEL' : type,
     text: spec.text,
     x: 0,
     y: 0,

@@ -7,9 +7,16 @@ import { describe, expect, it } from 'vitest';
 import { analyzeLayout } from '../layout';
 import {
   BORDER_CLEARANCE,
+  MIN_CONTRAST_RATIO,
   backgroundAt,
   buildTableCells,
+  clipMaskOffRules,
   clipMaskToRules,
+  contrastRatio,
+  isStatNotationOnly,
+  relativeLuminance,
+  sampleBackground,
+  textColorFor,
   fitTextToTableCell,
   isNumericTableCell,
   placeTableCellLines,
@@ -142,6 +149,7 @@ const fakeFont: TextMeasurer = {
 function cellInfo(overrides: Partial<TableCellInfo> = {}): TableCellInfo {
   return {
     id: 'p1-t1-r0c0',
+    kind: 'table',
     page: 1,
     tableId: 1,
     rowIndex: 0,
@@ -156,6 +164,8 @@ function cellInfo(overrides: Partial<TableCellInfo> = {}): TableCellInfo {
     header: false,
     trailingMarker: null,
     background: null,
+    maskable: true,
+    textOnDark: false,
     ...overrides,
   };
 }
@@ -271,13 +281,55 @@ describe('table cell clustering', () => {
     expect(result.ok).toBe(false);
   });
 
-  it('takes the cell background from a light fill and ignores dark or white ones', () => {
+  it('takes the cell background from the fill under it, whatever its lightness', () => {
     const box = { x: 50, y: 100, width: 60, height: 8 };
-    expect(backgroundAt(box, [{ x: 40, y: 95, width: 200, height: 20, color: '#f4f3ec' }])).toBe('#f4f3ec');
-    expect(backgroundAt(box, [{ x: 40, y: 95, width: 200, height: 20, color: '#adadad' }])).toBe('#adadad');
-    expect(backgroundAt(box, [{ x: 40, y: 95, width: 200, height: 20, color: '#ffffff' }])).toBeNull();
-    expect(backgroundAt(box, [{ x: 40, y: 95, width: 200, height: 20, color: '#202020' }])).toBeNull();
+    const fill = (color: string) => [{ x: 40, y: 95, width: 200, height: 20, color }];
+    expect(backgroundAt(box, fill('#f4f3ec'))).toBe('#f4f3ec');
+    expect(backgroundAt(box, fill('#adadad'))).toBe('#adadad');
+    expect(backgroundAt(box, fill('#202020'))).toBe('#202020'); // dark boxes keep their colour, text turns white
+    expect(backgroundAt(box, fill('#ffffff'))).toBeNull(); // white is plain paper
     expect(backgroundAt(box, [{ x: 400, y: 95, width: 20, height: 20, color: '#f4f3ec' }])).toBeNull();
+  });
+
+  it('reports a background it cannot sample reliably', () => {
+    const box = { x: 50, y: 100, width: 60, height: 8 };
+    const one = sampleBackground(box, [{ x: 40, y: 95, width: 200, height: 20, color: '#f4f3ec' }]);
+    expect(one).toEqual({ color: '#f4f3ec', ambiguous: false });
+    // two fills meeting inside the glyph box
+    const split = sampleBackground(box, [
+      { x: 40, y: 95, width: 40, height: 20, color: '#f4f3ec' },
+      { x: 80, y: 95, width: 160, height: 20, color: '#c0d0e0' },
+    ]);
+    expect(split.ambiguous).toBe(true);
+    // a raster image under the text
+    const overImage = sampleBackground(box, [], [{ x: 0, y: 0, width: 300, height: 300 }]);
+    expect(overImage.ambiguous).toBe(true);
+  });
+
+  it('picks the text colour by WCAG contrast', () => {
+    expect(textColorFor(null)).toBe('dark');
+    expect(textColorFor('#f4f3ec')).toBe('dark');
+    expect(textColorFor('#f1bf83')).toBe('dark'); // the flowchart's orange box
+    expect(textColorFor('#1f3864')).toBe('light'); // a dark navy header bar
+    expect(textColorFor('#000000')).toBe('light');
+    // every solid colour reaches the minimum with black or white text
+    for (const hex of ['#767676', '#808080', '#595959', '#a0a0a0']) {
+      const choice = textColorFor(hex);
+      expect(choice, hex).not.toBeNull();
+      const l = relativeLuminance(hex);
+      expect(contrastRatio(l, choice === 'light' ? 1 : 0)).toBeGreaterThanOrEqual(MIN_CONTRAST_RATIO);
+    }
+  });
+
+  it('keeps statistical notation out of the API', () => {
+    for (const t of ['OR (95% CI)', 'HR (95% CI)', 'aOR (95% CI)', 'SD', 'n (%)', 'P', 'RR', 'N']) {
+      expect(isStatNotationOnly(t), t).toBe(true);
+    }
+    for (const t of ['Odds ratio (95% CI)', 'Variable', 'Female', 'mean (SD)', 'Age at death']) {
+      expect(isStatNotationOnly(t), t).toBe(false);
+    }
+    // "No" is an answer in a flowchart, not the count abbreviation: it is translated
+    for (const t of ['No', 'Yes', 'No. (%)']) expect(isStatNotationOnly(t), t).toBe(false);
   });
 });
 
@@ -503,6 +555,23 @@ describe('tableCellMaskRects', () => {
     expect(aside).toEqual(mask);
   });
 
+  it('pulls a mask off a border it only reaches into (clipMaskOffRules)', () => {
+    const mask = { x: 70, y: 100, width: 100, height: 12 };
+    const rules: RuleLine[] = [
+      { orientation: 'horizontal', x0: 60, y0: 99.5, x1: 200, y1: 99.5, thickness: 0.5 }, // just under the mask
+      { orientation: 'vertical', x0: 170.4, y0: 90, x1: 170.4, y1: 130, thickness: 0.5 }, // just right of it
+      { orientation: 'horizontal', x0: 60, y0: 60, x1: 200, y1: 60, thickness: 0.5 }, // far away
+    ];
+    const clipped = clipMaskOffRules(mask, rules);
+    expect(clipped.y).toBeGreaterThanOrEqual(99.5 + 0.25 + BORDER_CLEARANCE - 1e-6);
+    expect(clipped.x + clipped.width).toBeLessThanOrEqual(170.4 - 0.25 - BORDER_CLEARANCE + 1e-6);
+    expect(clipped.y + clipped.height).toBeCloseTo(mask.y + mask.height); // the far rule changes nothing
+    expect(clipped.x).toBeCloseTo(mask.x);
+    // a rule drawn through the middle of the text is not an edge: the glyphs stay covered
+    const through = clipMaskOffRules(mask, [{ orientation: 'horizontal', x0: 60, y0: 106, x1: 200, y1: 106, thickness: 0.5 }]);
+    expect(through).toEqual(mask);
+  });
+
   it('23. does not over-mask the whitespace around a short line', () => {
     const masks = tableCellMaskRects(cell, lines);
     lines.forEach((line, i) => {
@@ -526,7 +595,20 @@ function analysisWithTable(): PdfAnalysis {
     fileSize: 1,
     pdfjsVersion: 'test',
     pageCount: 1,
-    pages: [{ pageNumber: 1, width: 612, height: 792, rotation: 0, view: [0, 0, 612, 792], textItemCount: items.length, images: [], rules: jamaRules(), fills: [] }],
+    pages: [
+      {
+        pageNumber: 1,
+        width: 612,
+        height: 792,
+        rotation: 0,
+        view: [0, 0, 612, 792],
+        textItemCount: items.length,
+        images: [],
+        rules: jamaRules(),
+        fills: [],
+        frames: [],
+      },
+    ],
     items,
     textItemCount: items.length,
     whitespaceItemCount: 0,

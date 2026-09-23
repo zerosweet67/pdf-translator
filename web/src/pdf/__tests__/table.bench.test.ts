@@ -21,7 +21,8 @@ import { trueTypeSubsetSafe, type FontRole, type FontSetBytes, type LoadedFont }
 import { analyzeLayout } from '../layout';
 import { assessOverlay, generateTranslatedPdf } from '../render';
 import { isCjkChar } from '../fit';
-import type { TranslationBlock, TranslationEntry } from '../types';
+import { estimateTokens } from '../../translate/batch';
+import type { TextBlock, TranslationBlock, TranslationEntry } from '../types';
 
 declare const process: { env: Record<string, string | undefined> };
 
@@ -93,7 +94,8 @@ describe.skipIf(!INPUT)('table benchmark', () => {
 
     const metrics: Record<string, unknown> = {};
     for (const variant of ['before', 'after'] as const) {
-      const layout = analyzeLayout(analysis, { resolveTables: variant === 'after' });
+      const on = variant === 'after';
+      const layout = analyzeLayout(analysis, { resolveTables: on, resolveFigures: on });
       assessOverlay(layout, analysis);
       const entries = new Map<string, TranslationEntry>();
       const tableUnits: TranslationBlock[] = [];
@@ -130,7 +132,45 @@ describe.skipIf(!INPUT)('table benchmark', () => {
       const tableBlocks = layout.blocks.filter((b) => b.type === 'TABLE');
       const overflowReports = result.reports.filter((r) => r.reason === 'TABLE_CELL_OVERFLOW');
       const tableWarnings = result.warnings.filter((w) => w.type === 'TABLE');
+
+      // --- figures ---------------------------------------------------------
+      const renderedPages = pageFilter ?? new Set(analysis.pages.map((p) => p.pageNumber));
+      const figureBlocks = layout.blocks.filter((b) => (on ? b.type === 'FIGURE' : false) && renderedPages.has(b.page));
+      const figureOverflow = result.reports.filter((r) => r.reason === 'FIGURE_CELL_OVERFLOW');
+      const figureUnits = layout.translationBlocks.filter((u) => u.type === 'FIGURE' && renderedPages.has(u.page));
+      const countItems = (list: readonly TextBlock[]) =>
+        list.reduce((n, b) => n + b.lines.reduce((m, l) => m + l.items.length, 0), 0);
+      // Before: the same source text, as the paragraph pipeline grouped it.
+      const figureRegionPages = new Set(layout.figures.map((f) => f.page));
+      const beforeFigureLike = layout.blocks.filter(
+        (b) => !on && renderedPages.has(b.page) && b.type !== 'HEADER' && b.type !== 'FOOTER' && b.cell === undefined,
+      );
+      let figureInputTokens = 0;
+      let figureOutputTokens = 0;
+      for (const u of figureUnits) {
+        figureInputTokens += estimateTokens(u.text) + 12;
+        figureOutputTokens += estimateTokens(entries.get(u.id)?.translation ?? '') + 12;
+      }
+      const figures = {
+        detected: layout.figures.filter((f) => renderedPages.has(f.page)).length,
+        summaries: layout.figures.filter((f) => renderedPages.has(f.page)),
+        textItems: on ? countItems(figureBlocks) : countItems(beforeFigureLike),
+        logicalUnits: figureBlocks.length,
+        translatedUnits: figureUnits.length,
+        numericSkipped: figureBlocks.filter((b) => b.cell?.numeric).length,
+        untranslatableSkipped: figureBlocks.filter((b) => !b.translate && !b.cell?.numeric).length,
+        written: result.stats.figureCellsWritten,
+        fallbackEnglish: figureOverflow.length,
+        fallbackDetails: figureOverflow.map((r) => ({ id: r.unitId, page: r.page, cell: r.cell, message: r.message })),
+        estimatedInputTokens: figureInputTokens,
+        estimatedOutputTokens: figureOutputTokens,
+        onDarkBackground: figureBlocks.filter((b) => b.cell?.textOnDark).length,
+        withBackgroundColour: figureBlocks.filter((b) => b.cell?.background).length,
+        regionPages: [...figureRegionPages],
+      };
       metrics[variant] = {
+        duplicateSourceItems: layout.stats.duplicateSourceItems,
+        figures,
         tableLayoutBlocks: tableBlocks.length,
         tableTranslationUnits: tableUnits.length,
         tableApiBlocks: tableUnits.filter((u) => entries.get(u.id)?.status === 'done').length,
@@ -145,7 +185,7 @@ describe.skipIf(!INPUT)('table benchmark', () => {
         cells:
           variant === 'after'
             ? layout.blocks
-                .filter((b) => b.cell)
+                .filter((b) => b.cell && renderedPages.has(b.page))
                 .map((b) => ({
                   id: b.id,
                   page: b.page,

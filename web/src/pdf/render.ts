@@ -39,6 +39,7 @@ import { fitTextToBoxes, type BoxSpec, MAX_EXTENSION_RATIO } from './fit';
 import { embedFontSet, FontLoadError, MixedFont, sanitizeForFont, type FontSetBytes, type TextRun } from './font';
 import { GLYPH_ASCENT, GLYPH_DESCENT } from './layout';
 import {
+  clipMaskOffRules,
   clipMaskToRules,
   fitTextToTableCell,
   placeTableCellLines,
@@ -64,8 +65,16 @@ import type {
 // Tunables
 // ---------------------------------------------------------------------------
 
-/** Block types written back in this version (TABLE: translated table labels / headers). */
-export const OVERLAY_TYPES: ReadonlySet<BlockType> = new Set(['TITLE', 'HEADING', 'BODY', 'CAPTION', 'FOOTNOTE', 'TABLE']);
+/** Block types written back in this version (TABLE / FIGURE: one logical cell or figure element each). */
+export const OVERLAY_TYPES: ReadonlySet<BlockType> = new Set([
+  'TITLE',
+  'HEADING',
+  'BODY',
+  'CAPTION',
+  'FOOTNOTE',
+  'TABLE',
+  'FIGURE',
+]);
 /** Leading footnote marker in the source text: "1 ", "12 ", "* ", "∗" (U+2217, math fonts), "† ", "¹ ". */
 const FOOTNOTE_MARKER_RE = /^(\d{1,3}|[*∗⁎†‡§¶]{1,2}|[¹²³⁴⁵⁶⁷⁸⁹⁰]{1,3})(?=\s|[A-Z(\[“"])/;
 /** Horizontal / vertical padding of the white mask around each source line (points). */
@@ -106,8 +115,9 @@ export interface RenderProgress {
   percent: number;
 }
 
-/** Table-cell details of a report (Developer Mode table diagnostics). */
+/** Cell details of a report (Developer Mode table / figure diagnostics). */
 export interface CellReport {
+  kind: 'table' | 'figure';
   tableId: number;
   row: number;
   column: number;
@@ -154,6 +164,10 @@ export interface RenderStats {
   tableCellsWritten: number;
   /** Table cells whose translation did not fit even at the minimum size: kept in English. */
   tableCellsOverflow: number;
+  /** Logical figure elements with a translation on the rendered pages. */
+  figureCells: number;
+  figureCellsWritten: number;
+  figureCellsOverflow: number;
 }
 
 export interface RenderResult {
@@ -346,6 +360,7 @@ function extensionFor(block: TextBlock, page: PageDebugInfo): number {
 
 const WHITE = rgb(1, 1, 1);
 const ORANGE = rgb(0.95, 0.5, 0.05);
+const PURPLE = rgb(0.55, 0.2, 0.75);
 const RED = rgb(0.85, 0.1, 0.1);
 const BLUE = rgb(0.15, 0.35, 0.9);
 const GREY = rgb(0.55, 0.55, 0.55);
@@ -416,7 +431,10 @@ function drawCellMasks(page: PDFPage, block: TextBlock, cell: TableCellInfo, pag
   });
   const color = hexColor(cell.background);
   let drawn = 0;
-  for (const r of tableCellMaskRects(cell, boxes)) {
+  for (const raw of tableCellMaskRects(cell, boxes)) {
+    // Borders, connectors, arrows and axis lines are never painted over.
+    const r = clipMaskOffRules(raw, pageInfo.rules);
+    if (r.width <= 0 || r.height <= 0) continue;
     const left = clamp(r.x, x0, x1);
     const right = clamp(r.x + r.width, x0, x1);
     const lo = clamp(r.y, y0, y1);
@@ -472,8 +490,9 @@ class PageTextWriter {
     return key;
   }
 
-  drawRuns(runs: readonly TextRun[], x: number, y: number, size: number): void {
-    const ops = [beginText(), setFillingRgbColor(0, 0, 0), setTextMatrix(1, 0, 0, 1, x, y)];
+  drawRuns(runs: readonly TextRun[], x: number, y: number, size: number, light = false): void {
+    const level = light ? 1 : 0;
+    const ops = [beginText(), setFillingRgbColor(level, level, level), setTextMatrix(1, 0, 0, 1, x, y)];
     for (const run of runs) ops.push(setFontAndSize(this.key(run.font), size), showText(run.font.encodeText(run.text)));
     ops.push(endText());
     this.page.pushOperators(...ops);
@@ -518,15 +537,16 @@ function drawBlockText(
   return { drawn, clipped, error: null };
 }
 
-/** Debug PDF: table cells in orange (solid: source text box, dashed: usable rectangle). */
+/** Debug PDF: table cells in orange, figure elements in purple (solid: glyph box, dashed: usable rectangle). */
 function drawDebugCell(page: PDFPage, block: TextBlock, cell: TableCellInfo, labelFont: PDFFont): void {
+  const color = cell.kind === 'figure' ? PURPLE : ORANGE;
   const rect = (r: Rect, dashed: boolean) =>
     page.drawRectangle({
       x: r.x,
       y: r.y,
       width: Math.max(0.1, r.width),
       height: Math.max(0.1, r.height),
-      borderColor: ORANGE,
+      borderColor: color,
       borderWidth: dashed ? 0.4 : 0.6,
       borderDashArray: dashed ? [1.5, 1.5] : undefined,
       color: undefined,
@@ -534,12 +554,12 @@ function drawDebugCell(page: PDFPage, block: TextBlock, cell: TableCellInfo, lab
   rect(cell.usable, true);
   rect(cell.textBox, false);
   try {
-    page.drawText(`t${cell.tableId} r${cell.rowIndex}c${cell.columnIndex}${cell.numeric ? ' #' : ''}`, {
+    page.drawText(`${cell.kind === 'figure' ? 'f' : 't'}${cell.tableId} r${cell.rowIndex}c${cell.columnIndex}${cell.numeric ? ' #' : ''}`, {
       x: cell.usable.x + 0.5,
       y: cell.usable.y + cell.usable.height - 3.5,
       size: 3,
       font: labelFont,
-      color: ORANGE,
+      color,
     });
   } catch {
     // labels are optional
@@ -677,16 +697,26 @@ function layoutTableCell(translation: string, block: TextBlock, cell: TableCellI
   };
 }
 
-/** Draw the fitted lines of a table cell at their placed positions, plus the footnote marker. */
-function drawTableCellText(writer: PageTextWriter, placement: CellPlacement, fontSize: number, mixed: MixedFont): DrawTextOutcome {
+/**
+ * Draw the fitted lines of a cell at their placed positions, plus the
+ * footnote marker. `light` writes white text, which is what a dark box
+ * background needs to stay readable (WCAG contrast, see table.ts).
+ */
+function drawTableCellText(
+  writer: PageTextWriter,
+  placement: CellPlacement,
+  fontSize: number,
+  mixed: MixedFont,
+  light: boolean,
+): DrawTextOutcome {
   let drawn = 0;
   try {
     for (const line of placement.lines) {
-      if (line.text.length > 0) writer.drawRuns(mixed.runs(line.text), line.x, line.y, fontSize);
+      if (line.text.length > 0) writer.drawRuns(mixed.runs(line.text), line.x, line.y, fontSize, light);
       drawn++;
     }
     const m = placement.marker;
-    if (m) writer.drawRuns(mixed.runs(m.text), m.x, m.y, m.fontSize);
+    if (m) writer.drawRuns(mixed.runs(m.text), m.x, m.y, m.fontSize, light);
   } catch (err) {
     return { drawn, clipped: 0, error: err instanceof Error ? err.message : String(err) };
   }
@@ -820,6 +850,9 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
     tableCells: 0,
     tableCellsWritten: 0,
     tableCellsOverflow: 0,
+    figureCells: 0,
+    figureCellsWritten: 0,
+    figureCellsOverflow: 0,
   };
   /** Layout blocks that are logical table cells (for the debug PDF). */
   const cellBlocks = layout.blocks.filter((b) => b.cell !== undefined);
@@ -858,7 +891,9 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         const cellBlock = sources.length === 1 ? sources[0] : null;
         try {
           if (cellBlock?.cell) {
-            stats.tableCells++;
+            const isFigure = cellBlock.cell.kind === 'figure';
+            if (isFigure) stats.figureCells++;
+            else stats.tableCells++;
             const cellLayout = layoutTableCell(entry.translation, cellBlock, cellBlock.cell, mixed as MixedFont);
             if (cellLayout.fits) {
               result = cellLayout;
@@ -867,15 +902,19 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
               const fit = cellLayout.table?.fit;
               const cell = cellBlock.cell;
               const reasonWord = fit?.reason === 'WIDTH' ? 'wider than the cell' : 'taller than the cell';
+              const where = isFigure
+                ? `figure ${cell.tableId}, element ${cell.rowIndex}`
+                : `table ${cell.tableId}, row ${cell.rowIndex}, column ${cell.columnIndex}`;
               const message =
                 `translation is ${reasonWord} by ${cellLayout.overflow.toFixed(1)} pt even at ${cellLayout.fontSize} pt ` +
-                `(table ${cell.tableId}, row ${cell.rowIndex}, column ${cell.columnIndex}); English kept`;
+                `(${where}); English kept`;
               reports.set(unit.id, {
                 unitId: unit.id,
                 sourceBlockIds: unit.sourceBlockIds,
                 page: unit.page,
                 type: unit.type,
                 cell: {
+                  kind: cell.kind,
                   tableId: cell.tableId,
                   row: cell.rowIndex,
                   column: cell.columnIndex,
@@ -887,14 +926,15 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
                 finalFontSize: cellLayout.fontSize,
                 lines: cellLayout.parts.get(cellBlock.id)?.length ?? 0,
                 warning: true,
-                reason: 'TABLE_CELL_OVERFLOW',
+                reason: isFigure ? 'FIGURE_CELL_OVERFLOW' : 'TABLE_CELL_OVERFLOW',
                 message,
                 skipped: true,
                 fallbackGlyphs: 0,
               });
               stats.unitsSkipped++;
-              stats.tableCellsOverflow++;
-              console.warn(`[PDF Render Warning] block=${unit.id} reason=TABLE_CELL_OVERFLOW (${message})`);
+              if (isFigure) stats.figureCellsOverflow++;
+              else stats.tableCellsOverflow++;
+              console.warn(`[PDF Render Warning] block=${unit.id} reason=CELL_OVERFLOW (${message})`);
             }
           } else {
             result = layoutUnit(unit, entry.translation, sources, pageById, mixed as MixedFont);
@@ -998,6 +1038,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         if (unitLayout.table && firstBlock?.cell) {
           const cell = firstBlock.cell;
           existing.cell = {
+            kind: cell.kind,
             tableId: cell.tableId,
             row: cell.rowIndex,
             column: cell.columnIndex,
@@ -1005,9 +1046,12 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
             finalFontSize: unitLayout.fontSize,
             overflowReason: null,
           };
-          stats.tableCellsWritten++;
-          if (unitLayout.fontSize < cell.fontSize) notes.push(`table cell shrunk from ${cell.fontSize} pt to ${unitLayout.fontSize} pt`);
-          if (unitLayout.lineHeight < unitLayout.fontSize * 1.1) notes.push('tight table line height');
+          if (cell.kind === 'figure') stats.figureCellsWritten++;
+          else stats.tableCellsWritten++;
+          const what = cell.kind === 'figure' ? 'figure element' : 'table cell';
+          if (unitLayout.fontSize < cell.fontSize) notes.push(`${what} shrunk from ${cell.fontSize} pt to ${unitLayout.fontSize} pt`);
+          if (unitLayout.lineHeight < unitLayout.fontSize * 1.1) notes.push('tight cell line height');
+          if (cell.textOnDark) notes.push(`drawn in white on ${cell.background ?? 'a dark background'}`);
         }
         if (!unitLayout.fits) {
           existing.warning = true;
@@ -1031,7 +1075,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         if (!block || block.page !== pageNumber) continue;
         const lines = unitLayout.parts.get(id) ?? [];
         const outcome = unitLayout.table
-          ? drawTableCellText(writer, unitLayout.table.placement, unitLayout.fontSize, mixed as MixedFont)
+          ? drawTableCellText(writer, unitLayout.table.placement, unitLayout.fontSize, mixed as MixedFont, block.cell?.textOnDark === true)
           : drawBlockText(
               writer,
               block,

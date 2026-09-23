@@ -65,7 +65,7 @@ const LEGACY_CONTEXT_RATIO = 150 / 120;
 
 /** Block types that get a short guidance line in the Worker prompt; BODY is the default and is not sent. */
 const TYPED_BLOCKS = new Set(['TITLE', 'HEADING', 'CAPTION', 'FOOTNOTE', 'TABLE']);
-/** Table units are logical cells (pdf/table.ts): the Worker gets the cell-specific guidance. */
+/** Table and figure units are logical cells (pdf/table.ts, pdf/figure.ts): the Worker gets the cell guidance. */
 const TABLE_CELL_TYPE = 'TABLE_CELL';
 
 /** Cheap token estimate: ~4 English characters or ~0.8 CJK character per token. */
@@ -201,7 +201,7 @@ export function buildPayload(
     if (b.previousContext && !prevInBatch) input.contextBefore = b.previousContext;
     if (b.nextContext && !nextInBatch) input.contextAfter = b.nextContext;
     if (b.incompleteSource) input.incompleteSource = true;
-    if (b.type === 'TABLE') input.type = TABLE_CELL_TYPE;
+    if (b.type === 'TABLE' || b.type === 'FIGURE') input.type = TABLE_CELL_TYPE;
     else if (TYPED_BLOCKS.has(b.type)) input.type = b.type;
     return input;
   });
