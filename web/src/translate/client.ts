@@ -60,11 +60,18 @@ export interface WorkerBlockInput {
   type?: string;
 }
 
-/** Provider token usage summed over the Worker's provider calls for one request. */
+/**
+ * Provider token usage summed over the Worker's provider calls for one request.
+ * Always the provider's actual counts, never an estimate.
+ *
+ * `cachedInputTokens` ⊆ `inputTokens` and `reasoningTokens` ⊆ `outputTokens`:
+ * when totalling, add input + output only (see translate/usage.ts).
+ */
 export interface WorkerUsage {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  reasoningTokens: number;
 }
 
 export interface WorkerBlockOutput {
@@ -372,7 +379,7 @@ function normalizeResponse(data: unknown): WorkerTranslateResponse {
     missing?: unknown;
     provider?: unknown;
     model?: unknown;
-    usage?: { inputTokens?: unknown; outputTokens?: unknown; cachedInputTokens?: unknown };
+    usage?: unknown;
     providerCalls?: unknown;
   };
   const blocks: WorkerBlockOutput[] = [];
@@ -387,26 +394,27 @@ function normalizeResponse(data: unknown): WorkerTranslateResponse {
     }
   }
   const missing = Array.isArray(raw.missing) ? raw.missing.filter((m): m is string => typeof m === 'string') : [];
-  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-  const usage =
-    raw.usage && typeof raw.usage === 'object'
-      ? { inputTokens: num(raw.usage.inputTokens), outputTokens: num(raw.usage.outputTokens), cachedInputTokens: num(raw.usage.cachedInputTokens) }
-      : undefined;
   return {
     blocks,
     missing,
     provider: typeof raw.provider === 'string' ? raw.provider : undefined,
     model: typeof raw.model === 'string' ? raw.model : undefined,
-    usage,
+    usage: normalizeUsage(raw.usage),
     providerCalls: typeof raw.providerCalls === 'number' ? raw.providerCalls : undefined,
   };
 }
 
+/** Worker usage block → WorkerUsage; undefined when the Worker reported none. */
 function normalizeUsage(raw: unknown): WorkerUsage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
-  const u = raw as { inputTokens?: unknown; outputTokens?: unknown; cachedInputTokens?: unknown };
-  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-  return { inputTokens: num(u.inputTokens), outputTokens: num(u.outputTokens), cachedInputTokens: num(u.cachedInputTokens) };
+  const u = raw as { inputTokens?: unknown; outputTokens?: unknown; cachedInputTokens?: unknown; reasoningTokens?: unknown };
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+  return {
+    inputTokens: num(u.inputTokens),
+    outputTokens: num(u.outputTokens),
+    cachedInputTokens: num(u.cachedInputTokens),
+    reasoningTokens: num(u.reasoningTokens),
+  };
 }
 
 function normalizeTerminologyResponse(data: unknown): WorkerTerminologyResponse {

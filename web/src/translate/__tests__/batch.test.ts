@@ -37,7 +37,7 @@ function fakeClient(options: { dropOnce?: string[]; usage?: boolean } = {}) {
         blocks: out,
         missing: [],
         providerCalls: 1,
-        usage: options.usage ? { inputTokens: 100 + blocks.length, outputTokens: 50, cachedInputTokens: 0 } : undefined,
+        usage: options.usage ? { inputTokens: 100 + blocks.length, outputTokens: 50, cachedInputTokens: 0, reasoningTokens: 0 } : undefined,
       };
     },
   } as unknown as TranslateClient;
@@ -156,7 +156,7 @@ describe('translateBlocks', () => {
     const blocks = Array.from({ length: 30 }, (_, i) => unit(`b${i}`, `Sentence number ${i} about numerical reasoning.`));
     const { stats } = await run(blocks, client);
     expect(stats.requests).toBe(2);
-    expect(stats.usage).toEqual({ inputTokens: 200 + 30, outputTokens: 100, cachedInputTokens: 0 });
+    expect(stats.usage).toEqual({ inputTokens: 200 + 30, outputTokens: 100, cachedInputTokens: 0, reasoningTokens: 0 });
     expect(stats.baselineRequests).toBe(2);
     expect(stats.baselineEstimatedInputTokens).toBeGreaterThan(stats.estimatedInputTokens);
     expect(stats.estimatedOutputTokens).toBeGreaterThan(0);

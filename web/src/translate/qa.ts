@@ -172,10 +172,11 @@ export async function runQualityAssurance(candidates: QaCandidate[], options: Qa
     stats.providerCalls += providerCalls;
     if (retry) stats.retryRequests++;
     if (usage) {
-      const u = stats.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+      const u = stats.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
       u.inputTokens += usage.inputTokens;
       u.outputTokens += usage.outputTokens;
       u.cachedInputTokens += usage.cachedInputTokens;
+      u.reasoningTokens += usage.reasoningTokens;
       stats.usage = u;
     }
   };

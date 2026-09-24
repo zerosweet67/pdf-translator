@@ -4,14 +4,17 @@ import {
   fitTextToBoxes,
   LINE_HEIGHT_RATIO,
   maxLinesFor,
+  measureSegments,
   minimumFontSize,
   textExtent,
   tokenize,
+  tokenizeInline,
   wrapText,
   wrapTokens,
   type TextMeasurer,
 } from '../fit';
 import { GLYPH_ASCENT, GLYPH_DESCENT } from '../layout';
+import { superscriptSize } from '../typography';
 
 /** CJK and fullwidth characters are 1 em wide, Latin 0.5 em, spaces 0.25 em. */
 const fakeFont: TextMeasurer = {
@@ -203,5 +206,89 @@ describe('fitTextToBoxes (merged units)', () => {
     const r = fitTextToBoxes(text, boxes, 10, fakeFont);
     expect(r.fits).toBe(false);
     expect(r.parts.flatMap((p) => p.lines).join('')).toBe(text);
+  });
+});
+
+describe('first-line indent', () => {
+  // Test 7: the first line of a paragraph is shorter by the indent.
+  it('shortens the first line and leaves the rest full width', () => {
+    const tokens = tokenize('一二三四五六七八九十'.repeat(3));
+    const plain = wrapTokens(tokens, fakeFont, 10, 100).lines;
+    const indented = wrapTokens(tokens, fakeFont, 10, 100, Number.POSITIVE_INFINITY, 20).lines;
+    expect(plain[0]).toHaveLength(10);
+    expect(indented[0]).toHaveLength(8); // 100 - 20 points = 8 CJK characters
+    expect(indented[1]).toHaveLength(10);
+    expect(indented.join('')).toBe(plain.join(''));
+  });
+
+  it('applies the indent of each box separately when a unit flows through several', () => {
+    const lineHeight = 10 * LINE_HEIGHT_RATIO;
+    const boxes = [
+      { width: 100, height: textExtent(2, 10, lineHeight), firstLineIndent: 20 },
+      { width: 100, height: textExtent(3, 10, lineHeight) },
+    ];
+    const text = '一二三四五六七八九十'.repeat(4);
+    const r = fitTextToBoxes(text, boxes, 10, fakeFont);
+    expect(r.parts[0].lines[0]).toHaveLength(8);
+    expect(r.parts[0].lines[1]).toHaveLength(10);
+    expect(r.parts.flatMap((p) => p.lines).join('')).toBe(text);
+  });
+
+  it('is ignored when it is zero', () => {
+    const tokens = tokenize('一二三四五六七八九十');
+    expect(wrapTokens(tokens, fakeFont, 10, 100, Number.POSITIVE_INFINITY, 0).lines).toEqual(
+      wrapTokens(tokens, fakeFont, 10, 100).lines,
+    );
+  });
+});
+
+describe('inline superscript wrapping', () => {
+  // Test 3 (measuring half) and test 4.
+  it('measures a raised marker at the superscript size', () => {
+    const size = 10;
+    const marker = [{ text: '62', sup: true }];
+    const plain = [{ text: '62', sup: false }];
+    expect(measureSegments(marker, fakeFont, size)).toBeLessThan(measureSegments(plain, fakeFont, size));
+    expect(measureSegments(marker, fakeFont, size)).toBeCloseTo(fakeFont.widthOfTextAtSize('62', superscriptSize(size)), 5);
+  });
+
+  it('never breaks a compound citation across a line', () => {
+    const tokens = tokenizeInline([
+      { text: '家庭照顧者負擔較高', sup: false },
+      { text: '16,27-29', sup: true },
+      { text: '。', sup: false },
+    ]);
+    const { lines, segmentLines } = wrapTokens(tokens, fakeFont, 10, 100);
+    expect(lines.join('')).toContain('16,27-29');
+    const raised = segmentLines.flat().filter((s) => s.sup);
+    expect(raised.map((s) => s.text)).toEqual(['16,27-29']);
+  });
+
+  it('reports the segments of every wrapped line in drawing order', () => {
+    const tokens = tokenizeInline([
+      { text: '前段', sup: false },
+      { text: '62', sup: true },
+      { text: '後段', sup: false },
+    ]);
+    const { segmentLines } = wrapTokens(tokens, fakeFont, 10, 200);
+    expect(segmentLines).toEqual([
+      [
+        { text: '前段', sup: false },
+        { text: '62', sup: true },
+        { text: '後段', sup: false },
+      ],
+    ]);
+  });
+
+  it('fits inline segments through fitTextToBoxes without losing the markers', () => {
+    const lineHeight = 10 * LINE_HEIGHT_RATIO;
+    const segments = [
+      { text: '一二三四五六七八九十一二三四五', sup: false },
+      { text: '16,27-29', sup: true },
+      { text: '。', sup: false },
+    ];
+    const r = fitTextToBoxes(segments, [{ width: 100, height: textExtent(3, 10, lineHeight) }], 10, fakeFont);
+    expect(r.parts[0].lines.join('')).toContain('16,27-29');
+    expect(r.parts[0].segmentLines.flat().filter((s) => s.sup).map((s) => s.text)).toEqual(['16,27-29']);
   });
 });

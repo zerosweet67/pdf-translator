@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { captionKind, classifyBlocks, isNumericOnly, looksLikeReferenceEntry } from '../classify';
+import { buildTranslationBlocks } from '../merge';
 import type { PageDebugInfo, TextBlock } from '../types';
 
 const PAGE_H = 792;
@@ -15,6 +16,8 @@ interface Spec {
   width?: number;
   fontSize?: number;
   lines?: number;
+  /** Real font name, for the bold / italic heuristics. */
+  font?: string;
 }
 
 let counter = 0;
@@ -37,7 +40,7 @@ function block(s: Spec): TextBlock {
     top: y + height,
     fontSize,
     fontName: 'f1',
-    fontRealName: 'TimesNewRomanPSMT',
+    fontRealName: s.font ?? 'TimesNewRomanPSMT',
     column: 'FULL',
     lineCount: lines,
     lines: [],
@@ -226,5 +229,100 @@ describe('helpers', () => {
       expect(isNumericOnly(t), t).toBe(true);
     for (const t of ['Female', 'Age, years', 'Smoking history', 'Body mass index', '95% CI', 'n (%)'])
       expect(isNumericOnly(t), t).toBe(false);
+  });
+});
+
+/**
+ * A wrapped body line that starts with a number matches NUMBERED_HEADING_RE
+ * ("15 ExT sessions between groups, whereas ..."), so the pattern only makes a
+ * candidate: heading evidence must be present and sentence-fragment evidence
+ * absent. These cases come from the real corpus.
+ */
+describe('numbered headings', () => {
+  function classify(specs: Spec[], pageCount = 1): TextBlock[] {
+    counter = 0;
+    const blocks = specs.map(block);
+    classifyBlocks(blocks, pages(pageCount), BODY);
+    return blocks;
+  }
+
+  const PARAGRAPH_START =
+    'Average ExT session volume, duration, SpO2 and breathlessness unpleasantness ratings were not different across the';
+  const WRAPPED_LINE = '15 ExT sessions between groups, whereas power output, HR, RPE, intensity ratings of';
+
+  it('does not read a wrapped body line as a heading (p9-b002)', () => {
+    const [prev, wrapped] = classify([
+      { page: 1, text: PARAGRAPH_START, fromTop: 100 },
+      { page: 1, text: WRAPPED_LINE, fromTop: 130 },
+    ]);
+    expect(prev.type).toBe('BODY');
+    expect(wrapped.type).toBe('BODY');
+    expect(wrapped.blockType).toBe('BODY');
+    expect(wrapped.translate).toBe(true);
+  });
+
+  it('merges that line back into its paragraph instead of leaving a half sentence', () => {
+    const blocks = classify([
+      { page: 1, text: PARAGRAPH_START, fromTop: 100 },
+      { page: 1, text: WRAPPED_LINE, fromTop: 130 },
+      { page: 1, text: 'breathlessness were significantly lower in the F2F compared to NF group (Figure 3).', fromTop: 160 },
+    ]);
+    const units = buildTranslationBlocks(blocks);
+    expect(units).toHaveLength(1);
+    expect(units[0].sourceBlockIds).toEqual(blocks.map((b) => b.id));
+    expect(units[0].incompleteSource).toBe(false);
+  });
+
+  it('rejects other sentence fragments that start with a number', () => {
+    const cases = [
+      '12 participants were excluded from the analysis, whereas the remaining 18,', // trailing comma
+      '15 ExT sessions between groups showed no difference in average power output', // sentence case, bare number
+      '20 patients completed the program and', // trailing conjunction
+    ];
+    for (const text of cases) {
+      const [b] = classify([{ page: 1, text, fromTop: 100 }]);
+      expect(b.type, text).not.toBe('HEADING');
+    }
+  });
+
+  it('keeps numbered headings that are set in the body size and weight', () => {
+    const cases = [
+      '1. Introduction',
+      '2. Background and Related Work',
+      '2.1 Data collection and analysis',
+      '3.1.2. Historical Perspective: The Emergence of AI in Finance',
+      'IV. Discussion',
+      'B. Supplementary Analyses',
+      '3 Results and Discussion', // LNCS style: no period after the number
+    ];
+    for (const text of cases) {
+      const [b] = classify([{ page: 1, text, fromTop: 100 }]);
+      expect(b.type, text).toBe('HEADING');
+    }
+  });
+
+  it('keeps numbered headings that carry heading typography', () => {
+    const italic = classify([{ page: 1, text: '3 Numerical Reasoning', fromTop: 100, font: 'NewBaskerville-Italic' }])[0];
+    expect(italic.type).toBe('HEADING');
+    const bold = classify([{ page: 1, text: '3 Enhanced accuracy in reporting', fromTop: 100, font: 'Cambria,Bold' }])[0];
+    expect(bold.type).toBe('HEADING');
+    const larger = classify([{ page: 1, text: '3 Numerical reasoning of models', fromTop: 100, fontSize: BODY * 1.2 }])[0];
+    expect(larger.type).toBe('HEADING');
+  });
+
+  it('keeps a numbered questionnaire item a heading after a finished paragraph', () => {
+    const [, item] = classify([
+      { page: 1, text: 'Please answer the following questions about the exercise program.', fromTop: 100 },
+      { page: 1, text: '1. What was your perceived benefit (overall) of the 5-week exercise program?', fromTop: 130 },
+    ]);
+    expect(item.type).toBe('HEADING');
+  });
+
+  it('a heading may follow a paragraph that only lacks its final period', () => {
+    const [, heading] = classify([
+      { page: 1, text: 'The effect of facial airflow on exercise tolerance in chronic lung disease', fromTop: 100 },
+      { page: 1, text: '2.1. Research Methodology: Approach and Design', fromTop: 130 },
+    ]);
+    expect(heading.type).toBe('HEADING');
   });
 });

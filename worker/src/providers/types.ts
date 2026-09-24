@@ -13,12 +13,19 @@ export interface ProviderTranslation {
   translation: string;
 }
 
-/** Token usage of one provider call, as reported by the provider. */
+/**
+ * Token usage of one provider call, as reported by the provider (never estimated).
+ *
+ * `cachedInputTokens` is a subset of `inputTokens` and `reasoningTokens` a subset
+ * of `outputTokens`; neither is ever added on top when totals are computed.
+ */
 export interface ProviderUsage {
   inputTokens: number;
   outputTokens: number;
   /** Prompt tokens served from the provider's prompt cache (part of inputTokens). */
   cachedInputTokens: number;
+  /** Reasoning / thinking tokens the model billed as output (part of outputTokens). */
+  reasoningTokens: number;
 }
 
 export interface ProviderResult {

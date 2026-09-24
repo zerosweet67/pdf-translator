@@ -34,6 +34,7 @@
 
 import { isUntranslatableText } from '../pdf/classify';
 import { isCjkChar } from '../pdf/fit';
+import { roleOf, WORKER_ROLE_TYPES } from '../pdf/roles';
 import type { BlockQuality, TranslationBlock, TranslationEntry } from '../pdf/types';
 import type { TranslationCache } from './cache';
 import { TranslateClient, TranslateClientError, type WorkerBlockInput, type WorkerUsage } from './client';
@@ -201,7 +202,11 @@ export function buildPayload(
     if (b.previousContext && !prevInBatch) input.contextBefore = b.previousContext;
     if (b.nextContext && !nextInBatch) input.contextAfter = b.nextContext;
     if (b.incompleteSource) input.incompleteSource = true;
-    if (b.type === 'TABLE' || b.type === 'FIGURE') input.type = TABLE_CELL_TYPE;
+    // A detector-assigned layout role (structured label, sidebar heading /
+    // label / body) carries its own one-line guidance; otherwise the block type.
+    const role = roleOf(b);
+    if (WORKER_ROLE_TYPES.has(role)) input.type = role;
+    else if (b.type === 'TABLE' || b.type === 'FIGURE') input.type = TABLE_CELL_TYPE;
     else if (TYPED_BLOCKS.has(b.type)) input.type = b.type;
     return input;
   });
@@ -433,10 +438,11 @@ export async function translateBlocks(
       if (ctx > 0) stats.extraContextBlocks++;
     }
     if (usage) {
-      const u = stats.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+      const u = stats.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
       u.inputTokens += usage.inputTokens;
       u.outputTokens += usage.outputTokens;
       u.cachedInputTokens += usage.cachedInputTokens;
+      u.reasoningTokens += usage.reasoningTokens;
       stats.usage = u;
     }
     if (retry) {

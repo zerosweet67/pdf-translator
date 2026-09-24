@@ -62,18 +62,56 @@
         <p class="error" id="error" role="alert" hidden></p>
       </section>
 
+      <!-- Translation scope: shown once the PDF is analysed; nothing is sent to the Worker before 開始翻譯 -->
+      <section class="card scope-card" id="scope-card" hidden>
+        <fieldset class="scope-modes" id="scope-modes">
+          <legend class="scope-title">翻譯範圍</legend>
+          <label class="radio"><input type="radio" name="scope-mode" value="all" checked /><span>整份論文</span></label>
+          <label class="radio"><input type="radio" name="scope-mode" value="chapters" /><span>選擇章節</span></label>
+          <label class="radio"><input type="radio" name="scope-mode" value="pages" /><span>自訂頁數</span></label>
+        </fieldset>
+        <div class="scope-panel" id="scope-chapters" hidden>
+          <p class="scope-hint" id="scope-chapter-count"></p>
+          <div class="chapter-tree" id="chapter-tree" role="group" aria-label="章節"></div>
+        </div>
+        <div class="scope-panel" id="scope-pages" hidden>
+          <div class="page-range">
+            <label class="page-field" for="scope-start">開始頁 <input type="number" id="scope-start" min="1" step="1" inputmode="numeric" /></label>
+            <label class="page-field" for="scope-end">結束頁 <input type="number" id="scope-end" min="1" step="1" inputmode="numeric" /></label>
+            <span class="scope-hint" id="scope-page-total"></span>
+          </div>
+        </div>
+        <label class="checkbox scope-full" id="scope-full-wrap" hidden>
+          <input type="checkbox" id="scope-full" />
+          <span>保留完整 PDF（未選取部分維持英文）</span>
+        </label>
+        <p class="scope-hint" id="scope-output"></p>
+        <p class="error" id="scope-error" role="alert" hidden></p>
+        <div class="scope-actions user-only">
+          <button type="button" class="btn btn-primary" id="scope-start-btn">開始翻譯</button>
+          <button type="button" class="btn-text" id="scope-reset">重新選擇檔案</button>
+        </div>
+        <p class="hint dev-only">Developer Mode: the scope applies to <strong>Translate Full PDF</strong> and to the PDF export ("Full PDF" range). Nothing is sent to the Worker until then.</p>
+        <details class="unit-details dev-only" id="scope-dev" open>
+          <summary id="scope-dev-summary">Translation Scope</summary>
+          <pre class="block-geom" id="scope-dev-list"></pre>
+        </details>
+      </section>
+
       <!-- User Mode: automatic analyze → translate → side-by-side PDF -->
       <section class="card user-only" id="job-card" hidden aria-live="polite">
         <div id="job-progress">
           <div class="job-head">
-            <p class="job-title">正在處理文件…</p>
+            <p class="job-title" id="job-title">正在分析文件…</p>
             <span class="job-percent" id="job-percent">0%</span>
           </div>
           <p class="visually-hidden" id="job-stage">正在讀取 PDF...</p>
           <progress class="job-bar" id="job-bar" max="100" value="0"></progress>
+          <p class="job-phase" id="job-phase">分析完成後會請你選擇翻譯範圍，這個階段不會開始翻譯。</p>
           <ol class="job-steps" id="job-steps">
             <li data-step="read">讀取 PDF</li>
             <li data-step="analyze">分析版面</li>
+            <li data-step="scope">選擇翻譯範圍</li>
             <li data-step="terminology">分析專業術語</li>
             <li data-step="translate">翻譯內容</li>
             <li data-step="qa">檢查翻譯品質</li>
@@ -83,10 +121,15 @@
         <div class="job-done" id="job-done" hidden>
           <p class="job-done-title">翻譯完成</p>
           <p class="job-note" id="job-note" hidden></p>
+          <p class="job-output" id="job-output" hidden></p>
+          <p class="job-usage" id="job-usage" hidden></p>
           <a class="btn btn-primary btn-download" id="job-download">下載中英對照 PDF</a>
         </div>
         <p class="error" id="job-error" role="alert" hidden></p>
-        <button type="button" class="btn-text" id="job-reset" hidden>重新選擇檔案</button>
+        <div class="job-actions">
+          <button type="button" class="btn-text" id="job-rescope" hidden>翻譯其他範圍</button>
+          <button type="button" class="btn-text" id="job-reset" hidden>重新選擇檔案</button>
+        </div>
       </section>
 
       <!-- Phase B + C: analysis result -->
@@ -123,10 +166,23 @@
         </div>
         <p class="hint" id="worker-info"></p>
 
+        <details class="unit-details" id="typography-diagnostics" hidden>
+          <summary id="typography-diagnostics-summary">排版診斷（標題層級 / 上標引用 / 段落間距 / 殘句合併）</summary>
+          <label class="checkbox"><input type="checkbox" id="typography-diagnostics-units" /> 顯示每一個標題、上標與殘句明細</label>
+          <pre class="block-geom" id="typography-diagnostics-list"></pre>
+        </details>
+
         <details class="unit-details" id="table-diagnostics" hidden>
           <summary id="table-diagnostics-summary">Table &amp; Figure Diagnostics</summary>
           <label class="checkbox"><input type="checkbox" id="table-diagnostics-cells" /> show every cell / figure element (bbox, usable bbox, row / column, alignment, font size, background)</label>
           <pre class="block-geom" id="table-diagnostics-list"></pre>
+        </details>
+
+        <details class="unit-details" id="role-diagnostics" hidden>
+          <summary id="role-diagnostics-summary">版面角色診斷（結構式摘要 / 側欄與重點框 / 來源歸屬）</summary>
+          <label class="checkbox"><input type="checkbox" id="role-diagnostics-blocks" /> 顯示每一個角色區塊（bbox、信心度、背景、訊號）</label>
+          <label class="checkbox"><input type="checkbox" id="role-diagnostics-overlay" checked /> Debug PDF 中標示版面角色（結構式摘要 bbox、側欄容器 bbox、內部子區塊 bbox）</label>
+          <pre class="block-geom" id="role-diagnostics-list"></pre>
         </details>
 
         <div id="blocks-panel" hidden>

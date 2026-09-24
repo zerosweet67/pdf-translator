@@ -126,7 +126,7 @@ async function callWithVerification<B extends { id: string }, T extends { id: st
 ): Promise<VerifiedCall<T>> {
   const wanted = new Set(blocks.map((b) => b.id));
   const results = new Map<string, T>();
-  const usage: ProviderUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const usage: ProviderUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
   let providerCalls = 0;
   const account = (u: ProviderUsage | undefined) => {
     providerCalls++;
@@ -134,6 +134,7 @@ async function callWithVerification<B extends { id: string }, T extends { id: st
     usage.inputTokens += u.inputTokens;
     usage.outputTokens += u.outputTokens;
     usage.cachedInputTokens += u.cachedInputTokens;
+    usage.reasoningTokens += u.reasoningTokens;
   };
   const absorb = (items: T[]) => {
     for (const r of items) {
@@ -368,7 +369,10 @@ async function handleProviderTask<T>(ctx: RequestContext, request: Request, task
 }
 
 function usageLog(usage: ProviderUsage, calls: number): string {
-  return `calls=${calls} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens}`;
+  return (
+    `calls=${calls} input=${usage.inputTokens} cached=${usage.cachedInputTokens} ` +
+    `output=${usage.outputTokens} reasoning=${usage.reasoningTokens}`
+  );
 }
 
 function handleTranslate(ctx: RequestContext, request: Request): Promise<Response> {
@@ -402,7 +406,7 @@ function handleTerminology(ctx: RequestContext, request: Request): Promise<Respo
     chars: (p) => p.samples.reduce((n, s) => n + s.length, 0),
     run: async (provider, parsed) => {
       const result = await provider.extractTerminology(parsed.samples);
-      const usage = result.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+      const usage = result.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
       return {
         body: { terms: result.terms, usage, providerCalls: 1 },
         log: `samples=${parsed.samples.length} terms=${result.terms.length} ${usageLog(usage, 1)}`,

@@ -7,9 +7,12 @@
  * Classification (TITLE / BODY / ...) and translate decisions live in classify.ts.
  */
 
-import { classifyBlocks, isAbbreviationOnly, isUntranslatableText } from './classify';
+import { captionKind, classifyBlocks, isAbbreviationOnly, isNumericRow, isUntranslatableText } from './classify';
+import { applyLayoutRoles, countRoleClaimedItems, emptyLayoutRoles } from './detectors/registry';
 import { buildFigureCells, detectFigureRegions, isUntranslatableFigureText, type FigureCaptionRef } from './figure';
 import { buildTranslationBlocks, contextStats } from './merge';
+import { absorbOrphanFragments } from './paragraph';
+import { collectBlockSubscripts, collectBlockSuperscripts } from './superscript';
 import { buildTableCells, type ResolvedCell, type TableItemRef } from './table';
 import { joinLines } from './text';
 import type {
@@ -36,6 +39,17 @@ import type {
 
 /** Items whose baselines differ by less than this × fontSize share a line. */
 const BASELINE_TOLERANCE = 0.5;
+/**
+ * Baseline difference (× fontSize) that counts as "the same baseline" however
+ * far apart the items are: the row labels of a table are regularly set a
+ * fifth of an em below their values, and the two ends of a running header
+ * rarely align to the point. Well below the line pitch of any column, and
+ * below the rise of a superscript, which reaches its line through the
+ * horizontal condition in joinsLine instead.
+ */
+const SAME_BASELINE_TOLERANCE = 0.25;
+/** A run this much smaller than a line may be a raised or lowered part of it, never a line of its own. */
+const MARKER_SIZE_RATIO = 0.9;
 /** Horizontal gap above this × fontSize splits a baseline cluster into separate lines. */
 const LINE_GAP_SPLIT = 0.8;
 /** Second pass inside one column: lines on the same baseline closer than this are merged. */
@@ -44,6 +58,16 @@ const LINE_GAP_MERGE = 2.0;
 const WORD_GAP = 0.12;
 /** Minimum body lines on each side of the page to call it two-column. */
 const MIN_COLUMN_LINES = 5;
+/** Two pieces of table furniture closer than this (× fontSize) belong to one table band. */
+const TABLE_BAND_MAX_GAP = 2.5;
+/** A table band is at least this tall (× fontSize) and carries at least two pieces of furniture. */
+const TABLE_BAND_MIN_HEIGHT = 1.5;
+const TABLE_BAND_MIN_MARKS = 2;
+/** A band holding a wide line of this many words of running text is a figure or a frame, not a table. */
+const BAND_PROSE_WORDS = 12;
+const BAND_PROSE_WIDTH = 0.5;
+/** How far above or below a band its caption may stand (× fontSize). */
+const BAND_CAPTION_REACH = 4;
 /** Max baseline distance (× fontSize) for two lines to be in one paragraph. */
 const MAX_LINE_PITCH = 1.8;
 /** Tighter pitch when the previous line is short (probable paragraph end). */
@@ -155,6 +179,113 @@ function makeLine(page: number, items: TextItemDebug[], column: ColumnRegion): T
 }
 
 /**
+ * A group of items that share one baseline, before the horizontal split.
+ *
+ * `anchorY` / `anchorFs` describe the group's dominant item: the first one
+ * with real text, replaced only by a strictly larger one. The anchor
+ * deliberately does not follow the items one by one — a reference that moved
+ * with every accepted item let a run of slightly different baselines walk a
+ * group down the page, one tolerance at a time, and a heading in the
+ * neighbouring column could bridge two baselines of this one into a single
+ * line whose words then interleaved.
+ */
+interface BaselineGroup {
+  items: TextItemDebug[];
+  anchorY: number;
+  anchorFs: number;
+  /** Whether any item carries real text; a group of markers alone is a satellite. */
+  hasLineText: boolean;
+  minX: number;
+  maxX: number;
+}
+
+/** Long enough to carry a baseline; "12", "*" or "d" is a marker or a symbol, not the line. */
+function isLineText(item: TextItemDebug): boolean {
+  return item.text.trim().length > 2;
+}
+
+function startGroup(item: TextItemDebug): BaselineGroup {
+  return {
+    items: [item],
+    anchorY: item.y,
+    anchorFs: item.fontSize,
+    hasLineText: isLineText(item),
+    minX: item.x,
+    maxX: itemRight(item),
+  };
+}
+
+function addToGroup(group: BaselineGroup, item: TextItemDebug): void {
+  group.items.push(item);
+  group.minX = Math.min(group.minX, item.x);
+  group.maxX = Math.max(group.maxX, itemRight(item));
+  // Take over the anchor only for the dominant item of the line: the first
+  // real text (a group may start at a raised marker), later a strictly larger
+  // one. Equal sizes never move the baseline.
+  if (isLineText(item) && (!group.hasLineText || item.fontSize > group.anchorFs)) {
+    group.anchorY = item.y;
+    group.anchorFs = item.fontSize;
+  }
+  group.hasLineText = group.hasLineText || isLineText(item);
+}
+
+/** Baseline difference of two groups, relative to the larger of their sizes. */
+function baselineGap(a: BaselineGroup, b: BaselineGroup): number {
+  return Math.abs(a.anchorY - b.anchorY) / Math.max(a.anchorFs, b.anchorFs);
+}
+
+/**
+ * Is `satellite` a run that belongs to the line of `host` rather than a line
+ * of its own? Either it carries no real text at all ("*", "62"), or it is set
+ * clearly smaller than the host, which is what a raised citation run
+ * ("16,27-29") and an inline subscript look like. A group in the host's size
+ * or larger is a line — that is what keeps the heading of the neighbouring
+ * column out of this one.
+ */
+function isSatelliteOf(satellite: BaselineGroup, host: BaselineGroup): boolean {
+  return !satellite.hasLineText || satellite.anchorFs <= MARKER_SIZE_RATIO * host.anchorFs;
+}
+
+function horizontallyNear(a: BaselineGroup, b: BaselineGroup): boolean {
+  const reach = LINE_GAP_SPLIT * Math.max(a.anchorFs, b.anchorFs);
+  return a.minX <= b.maxX + reach && a.maxX >= b.minX - reach;
+}
+
+/**
+ * Give every marker-only group (a raised citation number, a "#" on a table
+ * row) back to the line it belongs to: the nearest baseline within
+ * BASELINE_TOLERANCE that it touches horizontally. Merged groups are emptied,
+ * not removed, so the caller keeps the reading order of the rest.
+ *
+ * This is what the baseline tolerance used to do on its own, before the
+ * groups were built: doing it group by group makes it independent of the
+ * order in which the items arrive, which is what broke when a marker was
+ * followed by a single-letter item of the *other* column.
+ */
+function attachMarkerGroups(groups: BaselineGroup[]): void {
+  for (let i = 0; i < groups.length; i++) {
+    const satellite = groups[i];
+    if (satellite.items.length === 0) continue;
+    let host: BaselineGroup | null = null;
+    let bestGap = Number.POSITIVE_INFINITY;
+    for (let j = 0; j < groups.length; j++) {
+      if (j === i) continue;
+      const candidate = groups[j];
+      if (!candidate.hasLineText || candidate.items.length === 0) continue;
+      if (!isSatelliteOf(satellite, candidate)) continue;
+      const gap = baselineGap(satellite, candidate);
+      if (gap > BASELINE_TOLERANCE || gap >= bestGap) continue;
+      if (!horizontallyNear(satellite, candidate)) continue;
+      host = candidate;
+      bestGap = gap;
+    }
+    if (!host) continue;
+    for (const item of satellite.items) addToGroup(host, item);
+    satellite.items = [];
+  }
+}
+
+/**
  * Cluster items by baseline, then split each cluster by horizontal gaps.
  * Produces "preliminary" lines: a two-column page yields separate lines for
  * the left and right column because the gutter is wider than LINE_GAP_SPLIT.
@@ -162,33 +293,22 @@ function makeLine(page: number, items: TextItemDebug[], column: ColumnRegion): T
 function buildLines(items: TextItemDebug[], page: number): TextLine[] {
   const byY = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
 
-  // 1. baseline clusters
-  const clusters: TextItemDebug[][] = [];
-  let current: TextItemDebug[] = [];
-  let refY = 0;
-  let refFs = 0;
+  // 1. baseline groups: only items that really share a baseline, whatever
+  //    their horizontal distance (the cells of a table row, the two ends of a
+  //    running header). Raised and lowered markers follow in step 1b.
+  const groups: BaselineGroup[] = [];
   for (const item of byY) {
-    if (current.length === 0) {
-      current = [item];
-      refY = item.y;
-      refFs = item.fontSize;
-      continue;
-    }
-    const tol = BASELINE_TOLERANCE * Math.max(refFs, item.fontSize);
-    if (Math.abs(refY - item.y) <= tol) {
-      current.push(item);
-      if (item.text.trim().length > 2 && item.fontSize >= refFs) {
-        refY = item.y;
-        refFs = item.fontSize;
-      }
+    const current = groups[groups.length - 1];
+    if (current && Math.abs(current.anchorY - item.y) <= SAME_BASELINE_TOLERANCE * Math.max(current.anchorFs, item.fontSize)) {
+      addToGroup(current, item);
     } else {
-      clusters.push(current);
-      current = [item];
-      refY = item.y;
-      refFs = item.fontSize;
+      groups.push(startGroup(item));
     }
   }
-  if (current.length) clusters.push(current);
+
+  // 1b. markers back to their line
+  attachMarkerGroups(groups);
+  const clusters: TextItemDebug[][] = groups.filter((g) => g.items.length > 0).map((g) => g.items);
 
   // 2. split each cluster at wide horizontal gaps
   const lines: TextLine[] = [];
@@ -249,8 +369,104 @@ function detectColumns(lines: TextLine[], page: PageDebugInfo, bodyFontSize: num
   return { layout: 'SINGLE_COLUMN', gutter: null };
 }
 
-function assignRegion(line: TextLine, columns: ColumnInfo): ColumnRegion {
+/**
+ * Vertical band of a two-column page that a full-width table occupies.
+ * Its rows are read as one region, whatever the gutter says (see tableBands).
+ */
+export interface TableBand {
+  top: number;
+  bottom: number;
+}
+
+function crossesGutter(x0: number, x1: number, gutter: { left: number; right: number }): boolean {
+  return x0 < gutter.left && x1 > gutter.right;
+}
+
+/** Words of running text; the values of a table row are not words. */
+function proseWordCount(text: string): number {
+  return text.split(/\s+/).filter((t) => /[A-Za-z]{2,}/.test(t)).length;
+}
+
+function inBand(y: number, bands: readonly TableBand[]): boolean {
+  return bands.some((b) => y >= b.bottom && y <= b.top);
+}
+
+/**
+ * The vertical bands of a two-column page that a full-width table occupies.
+ *
+ * Nothing but a spanning table (or a figure) draws a horizontal rule or fills
+ * a cell across the column gutter, so this furniture locates the table
+ * without reading a single character. Marks closer than TABLE_BAND_MAX_GAP
+ * form one band; a band needs two marks and a real height, which leaves out
+ * the rule under a running header and the axis of a figure, and it is dropped
+ * again when it holds a wide line of running text, which a table row is not.
+ *
+ * Every line inside a band becomes SPANNING, because the gutter otherwise
+ * cuts each table row into a left, a spanning and a right piece, and grouping
+ * per region then stacks pieces of *different rows* into one block: the
+ * classifier reads that stack as a note or a heading, ends the table, and the
+ * values are translated as prose and drawn over the table.
+ */
+function tableBands(page: PageDebugInfo, columns: ColumnInfo, lines: readonly TextLine[], bodyFontSize: number): TableBand[] {
+  const gutter = columns.gutter;
+  if (columns.layout !== 'TWO_COLUMN' || !gutter) return [];
+
+  const marks: TableBand[] = [];
+  for (const r of page.rules) {
+    if (r.orientation !== 'horizontal') continue;
+    if (crossesGutter(Math.min(r.x0, r.x1), Math.max(r.x0, r.x1), gutter)) marks.push({ top: r.y0, bottom: r.y0 });
+  }
+  for (const f of page.fills) {
+    if (crossesGutter(f.x, f.x + f.width, gutter)) marks.push({ top: f.y + f.height, bottom: f.y });
+  }
+  if (marks.length < TABLE_BAND_MIN_MARKS) return [];
+  marks.sort((a, b) => b.top - a.top);
+
+  const grouped: { band: TableBand; marks: number }[] = [];
+  for (const mark of marks) {
+    const last = grouped[grouped.length - 1];
+    if (last && last.band.bottom - mark.top <= TABLE_BAND_MAX_GAP * bodyFontSize) {
+      last.band.bottom = Math.min(last.band.bottom, mark.bottom);
+      last.band.top = Math.max(last.band.top, mark.top);
+      last.marks++;
+    } else {
+      grouped.push({ band: { top: mark.top, bottom: mark.bottom }, marks: 1 });
+    }
+  }
+
+  const pageWidth = page.view[2] - page.view[0];
+  const isProse = (l: TextLine): boolean => l.width >= BAND_PROSE_WIDTH * pageWidth && proseWordCount(l.text) >= BAND_PROSE_WORDS;
+  return grouped
+    .filter((g) => g.marks >= TABLE_BAND_MIN_MARKS && g.band.top - g.band.bottom >= TABLE_BAND_MIN_HEIGHT * bodyFontSize)
+    .filter((g) => !lines.some((l) => inBand(l.y, [g.band]) && isProse(l)))
+    .filter((g) => introducedByTableCaption(g.band, lines, bodyFontSize))
+    .map((g) => g.band);
+}
+
+/**
+ * Does a table caption introduce this band?
+ *
+ * A figure drawn inside a frame leaves the same marks across the gutter as a
+ * table does, and its legend would then be cut into the band and grouped with
+ * the drawing. The caption right above (or below) the band says which it is,
+ * so only a band a *table* caption introduces is read as a table.
+ */
+function introducedByTableCaption(band: TableBand, lines: readonly TextLine[], bodyFontSize: number): boolean {
+  const reach = BAND_CAPTION_REACH * bodyFontSize;
+  let nearest: { distance: number; kind: 'FIGURE' | 'TABLE' } | null = null;
+  for (const line of lines) {
+    const distance = line.y > band.top ? line.y - band.top : line.y < band.bottom ? band.bottom - line.y : 0;
+    if (distance > reach) continue;
+    const kind = captionKind(line.text);
+    if (!kind) continue;
+    if (!nearest || distance < nearest.distance) nearest = { distance, kind };
+  }
+  return nearest?.kind === 'TABLE';
+}
+
+function assignRegion(line: TextLine, columns: ColumnInfo, bands: readonly TableBand[]): ColumnRegion {
   if (columns.layout === 'SINGLE_COLUMN' || !columns.gutter) return 'FULL';
+  if (inBand(line.y, bands)) return 'SPANNING';
   const { left, right } = columns.gutter;
   const lr = lineRight(line);
   if (line.x < left - 1 && lr > right + 1) return 'SPANNING';
@@ -781,6 +997,8 @@ export interface LayoutOptions {
   resolveTables?: boolean;
   /** Regroup the text of detected figures into logical elements (default true). */
   resolveFigures?: boolean;
+  /** Run the layout role detectors (sidebar / callout, structured abstract; default true). */
+  detectLayoutRoles?: boolean;
 }
 
 export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}): LayoutResult {
@@ -795,20 +1013,30 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
   const pageLayouts: PageLayout[] = [];
   const allBlocks: TextBlock[] = [];
   let lineCount = 0;
+  const bandsByPage = new Map<number, TableBand[]>();
 
   for (const pageInfo of analysis.pages) {
     const items = itemsByPage.get(pageInfo.pageNumber) ?? [];
     const prelim = buildLines(items, pageInfo.pageNumber);
     const columns = detectColumns(prelim, pageInfo, bodyFontSize);
 
-    const regioned = prelim.map((l) => ({ ...l, column: assignRegion(l, columns) }));
+    const bands = tableBands(pageInfo, columns, prelim, bodyFontSize);
+    if (bands.length) bandsByPage.set(pageInfo.pageNumber, bands);
+    const regioned = prelim.map((l) => ({ ...l, column: assignRegion(l, columns, bands) }));
     const lines = mergeSameBaseline(regioned, pageInfo.pageNumber);
     lineCount += lines.length;
 
     const regions: ColumnRegion[] = columns.layout === 'TWO_COLUMN' ? ['LEFT', 'RIGHT', 'SPANNING'] : ['FULL'];
     let pageBlocks: TextBlock[] = [];
     for (const region of regions) {
-      pageBlocks.push(...groupBlocks(lines.filter((l) => l.column === region), pageInfo.pageNumber, region));
+      const inRegion = lines.filter((l) => l.column === region);
+      // A table band is grouped on its own, so the last row of a table and
+      // the legend right under it never end up in one block.
+      const parts: TextLine[][] = [inRegion.filter((l) => !inBand(l.y, bands))];
+      for (const band of bands) parts.push(inRegion.filter((l) => inBand(l.y, [band])));
+      for (const part of parts) {
+        if (part.length) pageBlocks.push(...groupBlocks(part, pageInfo.pageNumber, region));
+      }
     }
 
     pageBlocks = orderBlocks(pageBlocks, columns.layout);
@@ -840,7 +1068,49 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
     options.resolveFigures === false
       ? { blocks: resolved.blocks, figures: [] }
       : resolveFigures(resolved.blocks, analysis, bodyFontSize);
-  const finalBlocks = withFigures.blocks;
+  // Generic layout roles: sidebar / callout containers and structured
+  // abstracts, on the final block set so table cells and figure elements
+  // are already owned by their own pipelines (pdf/detectors/registry.ts).
+  const roles =
+    options.detectLayoutRoles === false
+      ? emptyLayoutRoles(withFigures.blocks)
+      : applyLayoutRoles(withFigures.blocks, analysis, pageLayouts, bodyFontSize);
+  const finalBlocks = roles.blocks;
+
+  // Last line of defence for a full-width table: a row of values still
+  // standing inside a table band that the table pipeline did not turn into
+  // cells is table furniture, never prose, whatever type it was given. It
+  // keeps its text, it is simply not sent to the model and not overdrawn.
+  // Running text inside a band (the legend of a framed figure) is left alone.
+  let tableBandSuppressed = 0;
+  for (const b of finalBlocks) {
+    if (!b.translate || b.type === 'TABLE' || b.type === 'FIGURE' || b.type === 'CAPTION') continue;
+    if (!isNumericRow(b.text)) continue;
+    const bands = bandsByPage.get(b.page);
+    if (!bands || !inBand(b.y + b.height / 2, bands)) continue;
+    b.translate = false;
+    b.skipReason = 'TABLE_BAND_UNRESOLVED';
+    tableBandSuppressed++;
+  }
+
+  // Inline typography metadata and paragraph repair, both of which must see
+  // the final block set (table cells and figure text are already carved out).
+  let superscriptMarkerCount = 0;
+  let superscriptBlockCount = 0;
+  let superscriptGluedCount = 0;
+  for (const block of finalBlocks) {
+    if (block.cell) continue; // table cells and figure elements have their own marker path
+    const lowered = collectBlockSubscripts(block);
+    if (lowered.length > 0) block.subscripts = lowered;
+    const found = collectBlockSuperscripts(block);
+    if (found.markers.length === 0) continue;
+    block.superscripts = found.markers;
+    superscriptBlockCount++;
+    superscriptMarkerCount += found.metadataCount + found.gluedCount;
+    superscriptGluedCount += found.gluedCount;
+  }
+  const orphanPlan = absorbOrphanFragments(finalBlocks);
+
   const translationBlocks: TranslationBlock[] = buildTranslationBlocks(finalBlocks);
 
   const twoColumnPages = pageLayouts.filter((p) => p.layout === 'TWO_COLUMN').length;
@@ -855,11 +1125,19 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
     translationBlocks,
     tables,
     figures,
+    containers: roles.containers,
+    structuredRegions: roles.regions,
+    roleOwnership: roles.ownership,
     stats: {
       lineCount,
       blockCount: finalBlocks.length,
       translationBlockCount: translationBlocks.length,
       mergedBlockCount: translationBlocks.filter((b) => b.wasMerged).length,
+      orphanMergedCount: orphanPlan.merges.length,
+      orphanUnresolvedCount: orphanPlan.unresolved.length,
+      superscriptMarkerCount,
+      superscriptBlockCount,
+      superscriptGluedCount,
       incompleteBlockCount: translationBlocks.filter((b) => b.incompleteSource).length,
       twoColumnPages,
       singleColumnPages: pageLayouts.length - twoColumnPages,
@@ -874,7 +1152,15 @@ export function analyzeLayout(analysis: PdfAnalysis, options: LayoutOptions = {}
       figureTranslatedCells: figures.reduce((n, f) => n + f.translatedCells, 0),
       figureNumericCells: figures.reduce((n, f) => n + f.numericCells, 0),
       figureUnresolvedCount: figures.filter((f) => !f.resolved).length,
+      tableBandCount: [...bandsByPage.values()].reduce((n, b) => n + b.length, 0),
+      tableBandSuppressed,
       duplicateSourceItems: countDuplicateSourceItems(finalBlocks),
+      structuredRegionCount: roles.regions.length,
+      structuredLabelCount: roles.regions.reduce((n, r) => n + r.sections.length, 0),
+      sidebarCount: roles.containers.filter((c) => c.type === 'SIDEBAR').length,
+      calloutCount: roles.containers.filter((c) => c.type === 'CALLOUT_BOX').length,
+      sidebarChildCount: roles.containers.reduce((n, c) => n + c.children.length, 0),
+      roleClaimedSourceItems: countRoleClaimedItems(finalBlocks),
     },
   };
 }

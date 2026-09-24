@@ -18,13 +18,25 @@ const CAPTION_RE = /^(fig(ure)?s?\.?|table|scheme|chart|plate|algorithm|listing)
 const REFERENCES_HEADING_RE =
   /^(\d+\.?\s*)?(references?|bibliography|literature cited|works cited|reference list|references and notes)\s*[.:]?$/i;
 const ABSTRACT_RE = /^abstract\b/i;
+/**
+ * A *candidate* numbered heading: "3.", "3.1", "IV.", "B." followed by a
+ * capitalised, period-free line. The pattern alone decides nothing — every
+ * wrapped body line that starts with a number and happens to carry no full
+ * stop matches it too ("15 ExT sessions between groups, whereas power output,
+ * HR, RPE, intensity ratings of"). isNumberedHeading() weighs the evidence.
+ */
 const NUMBERED_HEADING_RE = /^(\d+(\.\d+)*\.?|[IVXLC]+\.?|[A-Z]\.)\s+[A-Z][^.]{2,90}$/;
+/** Numbering that is punctuated ("3." / "3.1" / "IV." / "B."), not a bare number that could simply open a sentence. */
+const PUNCTUATED_NUMBERING_RE = /^(\d+\.(\d+\.?)*|[IVXLC]+\.|[A-Z]\.)\s/;
+/** A line that stops in the middle of a clause is never a heading. */
+const ENDS_MID_CLAUSE_RE = /[,;，、；]$/;
 const PAGE_NUMBER_RE = /^(page\s+)?\d{1,4}(\s+(of|\/)\s+\d{1,4})?$/i;
 const DOI_RE = /^(doi:?\s*)?(https?:\/\/(dx\.)?doi\.org\/)?10\.\d{4,9}\/\S+$/i;
 const URL_RE = /^(https?:\/\/\S+|www\.\S+)$/i;
 const EMAIL_RE = /^[\w.+-]+@[\w-]+(\.[\w-]+)+$/;
 const CITATION_MARKER_RE = /^[[(]?\s*\d+(\s*[,;–-]\s*\d+)*\s*[\])]?$/;
 const BOLD_RE = /bold|black|heavy|semibold|demibold|extrabold|ultrabold/i;
+const ITALIC_RE = /italic|oblique/i;
 const MATH_SYMBOLS_RE = /[=+−×÷±∑∏∫√∞≈≠≤≥∂∇αβγδεθλμπσφψωΔΣΩ∈∉⊂⊃∪∩]/g;
 const AFFILIATION_RE =
   /\b(university|universit[aä]t|institute|department|dept\.?|school of|college|laboratory|hospital|center|centre|faculty|corresponding author|e-?mail)\b|@/i;
@@ -47,6 +59,70 @@ function letterCount(text: string): number {
 
 function isBoldFont(block: TextBlock): boolean {
   return BOLD_RE.test(block.fontRealName ?? '') || BOLD_RE.test(block.fontName);
+}
+
+function isItalicFont(block: TextBlock): boolean {
+  return ITALIC_RE.test(block.fontRealName ?? '') || ITALIC_RE.test(block.fontName);
+}
+
+function isAllCaps(text: string): boolean {
+  const letters = text.match(/[A-Za-z]/g) ?? [];
+  return letters.length >= 3 && letters.every((c) => c === c.toUpperCase());
+}
+
+/** Share of the content words (4+ letters) that start with a capital: headings are title-cased, wrapped body lines are not. */
+function isTitleCased(text: string): boolean {
+  const words = text.split(/\s+/).filter((w) => /[A-Za-z]{4,}/.test(w));
+  if (words.length === 0) return false;
+  const capitalised = words.filter((w) => /^[^A-Za-z]*[A-Z]/.test(w)).length;
+  return capitalised / words.length >= 0.7;
+}
+
+/** `b` continues the unfinished sentence of the paragraph right before it (same page, same column). */
+function continuesPreviousParagraph(prev: TextBlock, b: TextBlock): boolean {
+  if (prev.type !== 'BODY' || prev.page !== b.page || prev.column !== b.column) return false;
+  const c = analyzeCompleteness(prev.text);
+  return !c.complete && c.strong;
+}
+
+/**
+ * Does a NUMBERED_HEADING_RE hit really read as a heading?
+ *
+ * Treating every hit as a HEADING mis-filed wrapped body lines that start
+ * with a number, and one such line costs far more than a missed heading: the
+ * paragraph is no longer merged (merge.ts only merges like with like), half a
+ * sentence goes to the model as its own translation unit, typography draws the
+ * line as a heading, and chapter detection ends the surrounding chapter there.
+ *
+ * A hit therefore needs
+ *   - no sentence-fragment evidence: no trailing comma or semicolon, no
+ *     dangling function word / dash / open bracket, and it must not continue
+ *     the unfinished sentence of the BODY block right before it; and
+ *   - at least one piece of heading evidence: a larger font, bold, italic, all
+ *     caps, punctuated numbering, or a short title-cased line.
+ *
+ * Deliberately NOT required: a larger or bold font. Plenty of journals set
+ * numbered headings in the body size and weight (italic, or carried by the
+ * numbering alone), and demoting those would lose real chapters.
+ */
+function isNumberedHeading(b: TextBlock, rawText: string, fsRatio: number, words: number, prev: TextBlock | null): boolean {
+  if (b.lineCount > 2) return false;
+  const text = rawText.trim();
+  if (!NUMBERED_HEADING_RE.test(text)) return false;
+
+  if (ENDS_MID_CLAUSE_RE.test(text)) return false;
+  const self = analyzeCompleteness(text);
+  if (!self.complete && self.strong) return false; // "... ratings of", "... and", "... ("
+  if (prev && continuesPreviousParagraph(prev, b)) return false;
+
+  return (
+    fsRatio >= 1.08 ||
+    isBoldFont(b) ||
+    isItalicFont(b) ||
+    isAllCaps(text) ||
+    PUNCTUATED_NUMBERING_RE.test(text) ||
+    (words <= 8 && isTitleCased(text))
+  );
 }
 
 function looksLikeEquation(block: TextBlock): boolean {
@@ -146,6 +222,7 @@ export function classifyBlocks(blocks: TextBlock[], pages: PageDebugInfo[], body
   const questionPages = new Set(blocks.filter((b) => /\?\s*$/.test(b.text)).map((b) => b.page));
   const figurePages = new Set(blocks.filter((b) => captionKind(b.text) === 'FIGURE').map((b) => b.page));
 
+  let prevBlock: TextBlock | null = null;
   for (const b of blocks) {
     const g = pageGeom(pages, b.page);
     const text = b.text;
@@ -181,7 +258,7 @@ export function classifyBlocks(blocks: TextBlock[], pages: PageDebugInfo[], body
     } else if (
       (fsRatio >= 1.12 && b.lineCount <= 3 && text.length <= 200) ||
       (isBoldFont(b) && b.lineCount <= 2 && text.length <= 120 && !/[.;:]$/.test(text)) ||
-      (NUMBERED_HEADING_RE.test(text) && b.lineCount <= 2)
+      isNumberedHeading(b, text, fsRatio, words, prevBlock)
     ) {
       type = 'HEADING';
     } else if (looksLikeEquation(b)) {
@@ -218,6 +295,7 @@ export function classifyBlocks(blocks: TextBlock[], pages: PageDebugInfo[], body
     }
     b.sectionType = state.section;
     decideTranslate(b);
+    prevBlock = b;
   }
 
   markTableHeaders(tableMembers);
@@ -316,6 +394,26 @@ export function isNumericOnly(text: string): boolean {
     .replace(/\b(n|N|p|P|r|R|NS|ns|NA|N\/A|vs)\b/g, '')
     .replace(/[\d\s.,;:±+\-−–—%‰()[\]{}<>=≤≥*∗†‡§¶#/×x^~≈]/g, '');
   return stripped.length === 0 && (/\d/.test(text) || /^[-−–—\s]+$/.test(text.trim()));
+}
+
+/** A row whose tokens are values to this share is data, not prose. */
+const NUMERIC_ROW_SHARE = 0.6;
+/** ...and it must carry at least this many of them. */
+const NUMERIC_ROW_MIN_VALUES = 3;
+
+/**
+ * A table row that the layout could not cut into cells and that therefore
+ * arrives as one long text: "72.69 ± 3.7 95.54 ± 4.1 ... Post Apnea 137.03 ±
+ * 4.5 ...". It is wide and has many "words", so it looks like a paragraph to
+ * isParagraphLike() and like a note to NOTE_RE, and used to end the table and
+ * be translated as prose. Counted over the tokens that carry a letter or a
+ * digit, so the separators (±, <, %) of a value do not dilute the share.
+ */
+export function isNumericRow(text: string): boolean {
+  const tokens = text.split(/\s+/).filter((t) => /[A-Za-z0-9]/.test(t));
+  if (tokens.length === 0) return false;
+  const values = tokens.filter((t) => isNumericOnly(t)).length;
+  return values >= NUMERIC_ROW_MIN_VALUES && values / tokens.length >= NUMERIC_ROW_SHARE;
 }
 
 /** Upper-case abbreviations only ("COPD", "LABA + ICS", "FEV1/FVC"): the translation would return them unchanged. */
@@ -436,13 +534,16 @@ function classifySection(b: TextBlock, state: SectionState, m: BlockMetrics, tab
   const table = state.table;
   if (table) {
     const largeHeading = b.type === 'HEADING' && m.fsRatio >= 1.12;
+    // A row of values is never a note and never a paragraph, however wide it
+    // is and however many "words" it has: it stays inside the table.
+    const values = isNumericRow(text);
     if (b.page > table.lastPage + 1 || largeHeading) {
       state.table = null;
-    } else if (NOTE_RE.test(text) || (isParagraphLike(b, m) && m.fsRatio <= 0.92)) {
+    } else if (!values && (NOTE_RE.test(text) || (isParagraphLike(b, m) && m.fsRatio <= 0.92))) {
       setNote(b, 'TABLE', state);
       state.table = null;
       return;
-    } else if (isParagraphLike(b, m)) {
+    } else if (!values && isParagraphLike(b, m)) {
       state.table = null;
     } else {
       table.lastPage = b.page;

@@ -3,7 +3,12 @@
  *
  *  - tokenize: CJK characters break anywhere, Latin words / numbers / URLs /
  *    citations stay whole, CJK punctuation follows simple 禁則 rules.
- *  - wrapTokens: greedy line filling with real glyph widths.
+ *  - tokenizeInline: the same over inline segments, so a raised citation
+ *    marker is measured at its own (smaller) size and never separated from
+ *    the word it cites.
+ *  - wrapTokens: greedy line filling with real glyph widths, optionally with
+ *    a first-line indent; it returns both the plain lines and the inline
+ *    segments each line is made of.
  *  - fitTextToBox: shrink the font size step by step until the text fits,
  *    then allow a small downward extension, then report overflow.
  *  - fitTextToBoxes: the same for a merged unit whose text flows through
@@ -14,21 +19,25 @@
  */
 
 import { GLYPH_ASCENT, GLYPH_DESCENT } from './layout';
+import { superscriptSize, TYPOGRAPHY } from './typography';
+import type { InlineSegment } from './types';
 
 export interface TextMeasurer {
   widthOfTextAtSize(text: string, size: number): number;
 }
 
+// The numbers live in typography.ts so every layout constant sits in one
+// place; these names are the long-standing public API of this module.
 /** Baseline pitch relative to the font size. */
-export const LINE_HEIGHT_RATIO = 1.3;
+export const LINE_HEIGHT_RATIO = TYPOGRAPHY.fit.lineHeightRatio;
 /** Font size decrement per fitting iteration (points). */
-export const FONT_STEP = 0.5;
+export const FONT_STEP = TYPOGRAPHY.fit.fontStep;
 /** Hard lower bound for the font size (points). */
-export const MIN_FONT_SIZE_ABS = 6;
+export const MIN_FONT_SIZE_ABS = TYPOGRAPHY.fit.minFontSizeAbs;
 /** Never shrink below this fraction of the original font size. */
-export const MIN_FONT_SIZE_RATIO = 0.7;
+export const MIN_FONT_SIZE_RATIO = TYPOGRAPHY.fit.bodyMinRatio;
 /** A block may grow downward by at most this fraction of its height. */
-export const MAX_EXTENSION_RATIO = 0.25;
+export const MAX_EXTENSION_RATIO = TYPOGRAPHY.fit.maxExtensionRatio;
 const MAX_ITERATIONS = 80;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +49,15 @@ export type TokenKind = 'cjk' | 'word' | 'space' | 'open' | 'close';
 export interface Token {
   text: string;
   kind: TokenKind;
+  /** Drawn smaller and raised: a citation marker (see typography.ts). */
+  sup?: boolean;
+  /** Drawn smaller and lowered: a subscript run (see typography.ts). */
+  sub?: boolean;
+}
+
+/** Raised or lowered: either way the run is set at the script size. */
+export function isScriptToken(t: { sup?: boolean; sub?: boolean }): boolean {
+  return t.sup === true || t.sub === true;
 }
 
 /** Punctuation that must not start a line (行首禁則). */
@@ -121,12 +139,50 @@ export function tokenize(text: string): Token[] {
   return tokens;
 }
 
+/**
+ * Tokenize inline segments (pdf/inline.ts). A superscript segment is kept as
+ * ONE token whatever it contains, so "16,27-29" can never be broken across a
+ * line, and it is tagged so every later width lookup uses the smaller script
+ * size. A lowered run is tagged `sub` and handled the same way.
+ */
+export function tokenizeInline(segments: readonly InlineSegment[]): Token[] {
+  const out: Token[] = [];
+  for (const seg of segments) {
+    if (!seg.text) continue;
+    if (seg.sup) {
+      out.push({ text: seg.text, kind: 'word', sup: true });
+      continue;
+    }
+    if (seg.sub) {
+      out.push({ text: seg.text, kind: 'word', sub: true });
+      continue;
+    }
+    out.push(...tokenize(seg.text));
+  }
+  return out;
+}
+
+/** Merge consecutive tokens of one line into as few inline segments as possible. */
+function toSegments(tokens: readonly Token[]): InlineSegment[] {
+  const out: InlineSegment[] = [];
+  for (const t of tokens) {
+    const sup = t.sup === true;
+    const sub = t.sub === true;
+    const last = out[out.length - 1];
+    if (last && last.sup === sup && (last.sub === true) === sub) last.text += t.text;
+    else out.push(sub ? { text: t.text, sup, sub } : { text: t.text, sup });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Wrapping
 // ---------------------------------------------------------------------------
 
 export interface WrapResult {
   lines: string[];
+  /** The same lines split into ordinary and raised runs, in drawing order. */
+  segmentLines: InlineSegment[][];
   /** Tokens not placed because `maxLines` was reached (empty otherwise). */
   rest: Token[];
 }
@@ -147,14 +203,18 @@ export function wrapTokens(
   fontSize: number,
   maxWidth: number,
   maxLines = Number.POSITIVE_INFINITY,
+  firstLineIndent = 0,
 ): WrapResult {
   const tokens = [...input];
+  const supSize = superscriptSize(fontSize);
   const widthCache = new Map<string, number>();
   const widthOf = (t: Token): number => {
-    let w = widthCache.get(t.text);
+    const script = isScriptToken(t);
+    const key = script ? `\u0001${t.text}` : t.text;
+    let w = widthCache.get(key);
     if (w === undefined) {
-      w = font.widthOfTextAtSize(t.text, fontSize);
-      widthCache.set(t.text, w);
+      w = font.widthOfTextAtSize(t.text, script ? supSize : fontSize);
+      widthCache.set(key, w);
     }
     return w;
   };
@@ -165,13 +225,18 @@ export function wrapTokens(
   }
 
   const lines: string[] = [];
+  const segmentLines: InlineSegment[][] = [];
   let cur: Placed[] = [];
   let curWidth = 0;
   let i = 0;
 
+  /** The first line is shortened by the paragraph indent. */
+  const lineWidth = () => Math.max(1, maxWidth - (lines.length === 0 ? Math.max(0, firstLineIndent) : 0));
+
   const pushLine = () => {
     while (cur.length && cur[cur.length - 1].token.kind === 'space') cur.pop();
     lines.push(cur.map((p) => p.token.text).join(''));
+    segmentLines.push(toSegments(cur.map((p) => p.token)));
     cur = [];
     curWidth = 0;
   };
@@ -179,9 +244,10 @@ export function wrapTokens(
 
   while (i < tokens.length && lines.length < maxLines) {
     const t = tokens[i];
+    const maxWidthNow = lineWidth();
 
     if (t.kind === 'space') {
-      if (cur.length > 0 && curWidth + widthOf(t) <= maxWidth) {
+      if (cur.length > 0 && curWidth + widthOf(t) <= maxWidthNow) {
         cur.push({ token: t, index: i });
         curWidth += widthOf(t);
       }
@@ -191,13 +257,15 @@ export function wrapTokens(
 
     const w = widthOf(t);
 
-    if (cur.length === 0 && w > maxWidth) {
-      // Token wider than the whole line: split it by characters.
-      const chars = [...t.text];
+    if (cur.length === 0 && w > maxWidthNow) {
+      // Token wider than the whole line: split it by characters. A raised
+      // citation marker is never split: it stays one token so "16,27-29"
+      // cannot be torn apart by a line break.
+      const chars = t.sup ? [] : [...t.text];
       if (chars.length > 1) {
         let chunk = chars[0];
         for (let k = 1; k < chars.length; k++) {
-          if (font.widthOfTextAtSize(chunk + chars[k], fontSize) > maxWidth) break;
+          if (font.widthOfTextAtSize(chunk + chars[k], fontSize) > maxWidthNow) break;
           chunk += chars[k];
         }
         const remainder = t.text.slice(chunk.length);
@@ -210,7 +278,7 @@ export function wrapTokens(
       continue;
     }
 
-    if (curWidth + w <= maxWidth) {
+    if (curWidth + w <= maxWidthNow) {
       cur.push({ token: t, index: i });
       curWidth += w;
       i++;
@@ -263,12 +331,20 @@ export function wrapTokens(
 
   const rest = tokens.slice(restStart);
   while (rest.length && rest[0].kind === 'space') rest.shift();
-  return { lines, rest };
+  return { lines, segmentLines, rest };
 }
 
 /** Convenience: wrap a string with no line limit. */
 export function wrapText(text: string, font: TextMeasurer, fontSize: number, maxWidth: number): string[] {
   return wrapTokens(tokenize(text), font, fontSize, maxWidth).lines;
+}
+
+/** Width of one wrapped line, script runs measured at the smaller script size. */
+export function measureSegments(segments: readonly InlineSegment[], font: TextMeasurer, fontSize: number): number {
+  const supSize = superscriptSize(fontSize);
+  let width = 0;
+  for (const seg of segments) width += font.widthOfTextAtSize(seg.text, isScriptToken(seg) ? supSize : fontSize);
+  return width;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,17 +373,26 @@ export interface BoxSpec {
   height: number;
   /** Extra height allowed below the box, in points. Defaults to MAX_EXTENSION_RATIO × height. */
   maxExtension?: number;
+  /** First-line indent of THIS box, in points (paragraph.ts / typography.ts). */
+  firstLineIndent?: number;
 }
 
 export interface FitOptions extends BoxSpec {
-  text: string;
+  /** Plain text; ignored when `segments` is given. */
+  text?: string;
+  /** Inline segments (raised citation markers); preferred over `text`. */
+  segments?: readonly InlineSegment[];
   originalFontSize: number;
   font: TextMeasurer;
   minFontSize?: number;
+  /** Baseline pitch as a multiple of the font size; defaults to LINE_HEIGHT_RATIO. */
+  lineHeightRatio?: number;
 }
 
 export interface FitResult {
   lines: string[];
+  /** The same lines as inline runs, for the renderer. */
+  segmentLines: InlineSegment[][];
   fontSize: number;
   lineHeight: number;
   /** Extent of the wrapped text at the chosen size. */
@@ -329,10 +414,12 @@ export interface FitResult {
  * caller can still write everything and raise a warning. Text is never cut.
  */
 export function fitTextToBox(options: FitOptions): FitResult {
-  const { text, width, height, originalFontSize, font } = options;
+  const { width, height, originalFontSize, font } = options;
   const minFontSize = options.minFontSize ?? minimumFontSize(originalFontSize);
   const maxExtension = options.maxExtension ?? MAX_EXTENSION_RATIO * height;
-  const tokens = tokenize(text);
+  const ratio = options.lineHeightRatio ?? LINE_HEIGHT_RATIO;
+  const indent = options.firstLineIndent ?? 0;
+  const tokens = options.segments ? tokenizeInline(options.segments) : tokenize(options.text ?? '');
 
   let fontSize = originalFontSize;
   let iterations = 0;
@@ -340,10 +427,22 @@ export function fitTextToBox(options: FitOptions): FitResult {
 
   while (true) {
     iterations++;
-    const lineHeight = fontSize * LINE_HEIGHT_RATIO;
-    const lines = wrapTokens(tokens, font, fontSize, width).lines;
+    const lineHeight = fontSize * ratio;
+    const wrapped = wrapTokens(tokens, font, fontSize, width, Number.POSITIVE_INFINITY, indent);
+    const lines = wrapped.lines;
     const totalHeight = textExtent(lines.length, fontSize, lineHeight);
-    last = { lines, fontSize, lineHeight, totalHeight, fits: true, extended: false, overflow: 0, iterations, minFontSize };
+    last = {
+      lines,
+      segmentLines: wrapped.segmentLines,
+      fontSize,
+      lineHeight,
+      totalHeight,
+      fits: true,
+      extended: false,
+      overflow: 0,
+      iterations,
+      minFontSize,
+    };
     if (totalHeight <= height + 1e-6) return last;
     if (fontSize - FONT_STEP < minFontSize - 1e-9 || iterations >= MAX_ITERATIONS) break;
     fontSize = Math.round((fontSize - FONT_STEP) * 100) / 100;
@@ -355,6 +454,7 @@ export function fitTextToBox(options: FitOptions): FitResult {
 
 export interface MultiFitPart {
   lines: string[];
+  segmentLines: InlineSegment[][];
   totalHeight: number;
 }
 
@@ -378,19 +478,32 @@ export interface MultiFitResult {
  * treatment of fitTextToBox. All boxes share one font size.
  */
 export function fitTextToBoxes(
-  text: string,
+  content: string | readonly InlineSegment[],
   boxes: readonly BoxSpec[],
   originalFontSize: number,
   font: TextMeasurer,
   minFontSizeOverride?: number,
+  lineHeightRatio?: number,
 ): MultiFitResult {
   if (boxes.length === 0) throw new Error('fitTextToBoxes needs at least one box');
+  const segments = typeof content === 'string' ? undefined : content;
+  const text = typeof content === 'string' ? content : undefined;
+  const ratio = lineHeightRatio ?? LINE_HEIGHT_RATIO;
+
   if (boxes.length === 1) {
-    const r = fitTextToBox({ text, ...boxes[0], originalFontSize, font, minFontSize: minFontSizeOverride });
+    const r = fitTextToBox({
+      text,
+      segments,
+      ...boxes[0],
+      originalFontSize,
+      font,
+      minFontSize: minFontSizeOverride,
+      lineHeightRatio: ratio,
+    });
     return {
       fontSize: r.fontSize,
       lineHeight: r.lineHeight,
-      parts: [{ lines: r.lines, totalHeight: r.totalHeight }],
+      parts: [{ lines: r.lines, segmentLines: r.segmentLines, totalHeight: r.totalHeight }],
       fits: r.fits,
       extended: r.extended,
       overflow: r.overflow,
@@ -400,7 +513,7 @@ export function fitTextToBoxes(
   }
 
   const minFontSize = minFontSizeOverride ?? minimumFontSize(originalFontSize);
-  const tokens = tokenize(text);
+  const tokens = segments ? tokenizeInline(segments) : tokenize(text ?? '');
   const lastBox = boxes[boxes.length - 1];
   const maxExtension = lastBox.maxExtension ?? MAX_EXTENSION_RATIO * lastBox.height;
 
@@ -410,7 +523,7 @@ export function fitTextToBoxes(
 
   while (true) {
     iterations++;
-    const lineHeight = fontSize * LINE_HEIGHT_RATIO;
+    const lineHeight = fontSize * ratio;
     const parts: MultiFitPart[] = [];
     let rest: Token[] = tokens;
     let lastHeight = 0;
@@ -418,9 +531,9 @@ export function fitTextToBoxes(
       const box = boxes[k];
       const isLast = k === boxes.length - 1;
       const capacity = isLast ? Number.POSITIVE_INFINITY : maxLinesFor(box.height, fontSize, lineHeight);
-      const r = wrapTokens(rest, font, fontSize, box.width, capacity);
+      const r = wrapTokens(rest, font, fontSize, box.width, capacity, box.firstLineIndent ?? 0);
       const totalHeight = textExtent(r.lines.length, fontSize, lineHeight);
-      parts.push({ lines: r.lines, totalHeight });
+      parts.push({ lines: r.lines, segmentLines: r.segmentLines, totalHeight });
       rest = r.rest;
       if (isLast) lastHeight = totalHeight;
     }

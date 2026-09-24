@@ -9,10 +9,13 @@
  * Phase D–F: pdf-lib overlay → downloadable <name>_zh-TW.pdf (or a debug
  * bounding-box PDF to verify coordinates first).
  *
- * User Mode (default): choosing a file runs analyze → translate everything →
- * side-by-side bilingual PDF automatically and only shows simple progress.
- * Developer Mode (?debug=true): every tool above, unchanged. Both modes use
- * the same analyzePdf() / translateAll() / buildPdf() core.
+ * User Mode (default): choosing a file runs analyze → chapter detection →
+ * translation scope (whole document / chapters / page range) → 開始翻譯 →
+ * translate the selected final logical units → side-by-side bilingual PDF,
+ * with simple progress only. Nothing is sent to the Worker before 開始翻譯.
+ * Developer Mode (?debug=true): every tool above, unchanged; the scope applies
+ * to Translate Full PDF and the export. Both modes use the same analyzePdf() /
+ * resolveTranslationScope() / translateAll() / buildPdf() core.
  *
  * The PDF is read with the File API into an ArrayBuffer and never uploaded.
  * Only JSON text blocks (plus an optional terminology map) go to the Worker.
@@ -23,6 +26,7 @@ import './styles.css';
 import { extractPdf } from './pdf/extract';
 import { FONT_SOURCES, FontLoadError, loadFontSet } from './pdf/font';
 import { analyzeLayout } from './pdf/layout';
+import { TYPOGRAPHY } from './pdf/typography';
 import {
   assessOverlay,
   generateTranslatedPdf,
@@ -33,12 +37,26 @@ import {
 } from './pdf/render';
 import type { FontSetBytes } from './pdf/font';
 import type { RenderProgress } from './pdf/render';
-import type { LayoutResult, PdfAnalysis, TextBlock, TextItemDebug, TranslationBlock, TranslationEntry } from './pdf/types';
+import type { LayoutResult, LayoutRole, PdfAnalysis, TextBlock, TextItemDebug, TranslationBlock, TranslationEntry } from './pdf/types';
+import { ROLE_LABELS_ZH, roleOf } from './pdf/roles';
+import { SIDEBAR_MIN_CONFIDENCE } from './pdf/detectors/sidebar';
+import { STRUCTURED_MIN_LABEL_CONFIDENCE, STRUCTURED_MIN_REGION_CONFIDENCE } from './pdf/detectors/structuredAbstract';
 import type { TranslationStats } from './translate/batch';
 import { TranslationCache } from './translate/cache';
 import { TranslateClient, type WorkerUsage } from './translate/client';
-import { translateDocument, type DocumentTranslationOptions, type DocumentTranslationResult } from './translate/pipeline';
+import { chapterPageLabel, chapterSubtreeIds, detectChapters, type ChapterDetection, type ChapterInfo } from './scope/chapters';
+import { resolveOutputPages, withOutputSuffix, type OutputPages } from './scope/output';
+import {
+  resolveTranslationScope,
+  terminologyContextUnits,
+  unitsInDocumentOrder,
+  type ScopeResolution,
+  type TranslationScope,
+} from './scope/scope';
+import { clearTerminologyCache, translateDocument, type DocumentTranslationOptions, type DocumentTranslationResult } from './translate/pipeline';
 import { clearSession, getSessionToken, saveSession } from './translate/session';
+import { documentFingerprint, fnv1a } from './translate/terminology';
+import { JobUsage, formatTokens, formatUsageBreakdown } from './translate/usage';
 import { WORKER_URL } from './config';
 
 const DEBUG_ITEM_LIMIT = 50;
@@ -93,10 +111,19 @@ const blocksPanel = byId<HTMLDivElement>('blocks-panel');
 const blocksOnlyTranslate = byId<HTMLInputElement>('blocks-only-translate');
 const blocksList = byId<HTMLDivElement>('blocks-list');
 
+const typographyDiagnostics = byId<HTMLDetailsElement>('typography-diagnostics');
+const typographyDiagnosticsSummary = byId<HTMLElement>('typography-diagnostics-summary');
+const typographyDiagnosticsUnits = byId<HTMLInputElement>('typography-diagnostics-units');
+const typographyDiagnosticsList = byId<HTMLPreElement>('typography-diagnostics-list');
 const tableDiagnostics = byId<HTMLDetailsElement>('table-diagnostics');
 const tableDiagnosticsSummary = byId<HTMLElement>('table-diagnostics-summary');
 const tableDiagnosticsCells = byId<HTMLInputElement>('table-diagnostics-cells');
 const tableDiagnosticsList = byId<HTMLPreElement>('table-diagnostics-list');
+const roleDiagnostics = byId<HTMLDetailsElement>('role-diagnostics');
+const roleDiagnosticsSummary = byId<HTMLElement>('role-diagnostics-summary');
+const roleDiagnosticsBlocks = byId<HTMLInputElement>('role-diagnostics-blocks');
+const roleDiagnosticsOverlay = byId<HTMLInputElement>('role-diagnostics-overlay');
+const roleDiagnosticsList = byId<HTMLPreElement>('role-diagnostics-list');
 const debugPanel = byId<HTMLDivElement>('debug-panel');
 const debugLimitEl = byId<HTMLElement>('debug-limit');
 const debugList = byId<HTMLDivElement>('debug-list');
@@ -155,12 +182,36 @@ const jobStage = byId<HTMLParagraphElement>('job-stage');
 const jobPercent = byId<HTMLElement>('job-percent');
 const jobBar = byId<HTMLProgressElement>('job-bar');
 const jobSteps = byId<HTMLOListElement>('job-steps');
+const jobTitle = byId<HTMLParagraphElement>('job-title');
+const jobPhase = byId<HTMLParagraphElement>('job-phase');
 const jobDone = byId<HTMLDivElement>('job-done');
 const jobNote = byId<HTMLParagraphElement>('job-note');
+const jobOutput = byId<HTMLParagraphElement>('job-output');
+const jobUsageEl = byId<HTMLParagraphElement>('job-usage');
 const jobDownload = byId<HTMLAnchorElement>('job-download');
 const jobError = byId<HTMLParagraphElement>('job-error');
 const jobReset = byId<HTMLButtonElement>('job-reset');
+const jobRescope = byId<HTMLButtonElement>('job-rescope');
 const uploadNote = byId<HTMLParagraphElement>('upload-note');
+
+// Translation scope (both modes)
+const scopeCard = byId<HTMLElement>('scope-card');
+const scopeModeInputs = [...scopeCard.querySelectorAll<HTMLInputElement>('input[name="scope-mode"]')];
+const scopeChaptersPanel = byId<HTMLDivElement>('scope-chapters');
+const scopeChapterCount = byId<HTMLParagraphElement>('scope-chapter-count');
+const chapterTree = byId<HTMLDivElement>('chapter-tree');
+const scopePagesPanel = byId<HTMLDivElement>('scope-pages');
+const scopeStartInput = byId<HTMLInputElement>('scope-start');
+const scopeEndInput = byId<HTMLInputElement>('scope-end');
+const scopePageTotal = byId<HTMLElement>('scope-page-total');
+const scopeFullWrap = byId<HTMLLabelElement>('scope-full-wrap');
+const scopeFull = byId<HTMLInputElement>('scope-full');
+const scopeOutput = byId<HTMLParagraphElement>('scope-output');
+const scopeError = byId<HTMLParagraphElement>('scope-error');
+const scopeStartBtn = byId<HTMLButtonElement>('scope-start-btn');
+const scopeReset = byId<HTMLButtonElement>('scope-reset');
+const scopeDevSummary = byId<HTMLElement>('scope-dev-summary');
+const scopeDevList = byId<HTMLPreElement>('scope-dev-list');
 
 // Invite gate
 const inviteForm = byId<HTMLFormElement>('invite-form');
@@ -187,10 +238,19 @@ let generatedUrl: string | null = null;
 let providerLabel = 'OpenAI';
 /** Last PDF export, for the table diagnostics (overflow / fallback cells). */
 let lastRenderResult: RenderResult | null = null;
+/** Chapters of the current PDF (native outline first, HEADING units otherwise); null before analysis. */
+let chapterDetection: ChapterDetection | null = null;
+/** Ticked chapter checkboxes (a parent is included once all its children are ticked). */
+let checkedChapterIds = new Set<string>();
+/** Scope of the last translation run: drives the PDF export and the Developer Mode panel. */
+let lastScope: ScopeResolution | null = null;
+/** Pages the last export wrote, for the "輸出頁面" line under the download button. */
+let lastOutput: OutputPages | null = null;
 
 /**
- * One job per selected file. Selecting another file aborts the previous job:
- * its remaining batches are not sent and none of its results reach the UI.
+ * One job per selected file and per translation run (開始翻譯 / Translate Full
+ * PDF): a new file or a new scope run aborts the previous job, so its
+ * remaining batches are not sent and none of its results reach the UI.
  */
 interface Job {
   id: number;
@@ -199,9 +259,16 @@ interface Job {
 let jobCounter = 0;
 let currentJob: Job | null = null;
 
+/**
+ * Token usage of the current job. Every provider call of this file (terminology,
+ * translation incl. retries, QA) adds to it; a new file starts at zero.
+ */
+let jobUsage = new JobUsage();
+
 function startJob(): Job {
   currentJob?.controller.abort();
   currentJob = { id: ++jobCounter, controller: new AbortController() };
+  jobUsage = new JobUsage(); // per-job counters: a new PDF or scope run never inherits earlier tokens
   return currentJob;
 }
 
@@ -298,6 +365,9 @@ function resetResults(): void {
   currentLayout = null;
   entries = new Map();
   selectedIds = new Set();
+  resetScopeUi();
+  lastScope = null;
+  clearTerminologyCache(); // the scope-keyed auto glossary belongs to the previous PDF
   resetExport();
   resultsEl.hidden = true;
   warningEl.hidden = true;
@@ -311,6 +381,8 @@ function resetResults(): void {
   debugToggle.textContent = 'Show Debug Data';
   tableDiagnostics.hidden = true;
   tableDiagnosticsList.textContent = '';
+  typographyDiagnostics.hidden = true;
+  typographyDiagnosticsList.textContent = '';
   lastRenderResult = null;
 
   testSection.hidden = true;
@@ -474,7 +546,7 @@ async function handleFile(file: File | undefined): Promise<void> {
   fileInfo.hidden = false;
   analyzeBtn.disabled = false;
 
-  if (!DEBUG_MODE) void runAutoPipeline(file, job);
+  if (!DEBUG_MODE) void runAnalysisJob(file, job);
 }
 
 chooseBtn.addEventListener('click', () => fileInput.click());
@@ -568,6 +640,7 @@ async function runAnalysis(): Promise<void> {
     if (layout && layout.stats.translationBlockCount > 0) {
       exportSection.hidden = false;
       updateExportUi();
+      showScopeCard();
     }
   } catch (err) {
     console.error('[PDF Analysis] failed', err);
@@ -617,6 +690,103 @@ function describeLayout(layout: LayoutResult): string {
   if (singleColumnPages === 0) return 'Two Columns';
   const twoCol = layout.pages.filter((p) => p.layout === 'TWO_COLUMN').map((p) => p.pageNumber);
   return `Two Columns on ${twoColumnPages} page(s) [${twoCol.slice(0, 12).join(', ')}${twoCol.length > 12 ? ', …' : ''}], Single on ${singleColumnPages}`;
+}
+
+/**
+ * Developer Mode (繁體中文): what the typography pass did — heading
+ * hierarchy, superscript citation reconstruction, paragraph indent / spacing
+ * and the sentence tails that were merged back into their paragraph. User
+ * Mode never sees this panel (the whole card is `dev-only`).
+ */
+function renderTypographyDiagnostics(layout: LayoutResult, render: RenderResult | null): void {
+  const st = layout.stats;
+  const t = render?.stats.typography ?? null;
+  const body = layout.bodyFontSize;
+  const orphanBlocks = layout.blocks.filter((b) => b.orphanOf);
+  const supBlocks = layout.blocks.filter((b) => b.superscripts?.length);
+  const paragraphReports = render ? render.reports.filter((r) => r.typography) : [];
+  const headingReports = paragraphReports.filter((r) => r.typography?.role === 'title' || r.typography?.role === 'heading');
+  const flat = headingReports.filter((r) => (r.typography?.bodyRatio ?? 0) < TYPOGRAPHY.minHeadingBodyRatio - 0.01);
+
+  typographyDiagnosticsSummary.textContent =
+    `排版診斷：標題 ${t ? t.titles + t.headings : headingReports.length} 個` +
+    (t ? ` · 加粗 ${t.boldDrawn} · 放大 ${t.sizeBoosted} · 觸底 ${t.floorApplied}` : '') +
+    ` · 上標引用 ${t ? t.superscriptRuns : st.superscriptMarkerCount} 個` +
+    ` · 殘句合併 ${st.orphanMergedCount} 個` +
+    (st.orphanUnresolvedCount ? ` · 未解決殘句 ${st.orphanUnresolvedCount}` : '');
+
+  const lines: string[] = [
+    `【標題層級】內文基準字級（body）：${body} pt`,
+    `  設定：TITLE 起始 ${TYPOGRAPHY.title.sizeScale}× body，下限 ${TYPOGRAPHY.minTitleBodyRatio}× body`,
+    `        HEADING 起始 ${TYPOGRAPHY.heading.sizeScale}× body，下限 ${TYPOGRAPHY.minHeadingBodyRatio}× body`,
+    `        BODY 維持原尺寸，最多縮到 ${TYPOGRAPHY.fit.bodyMinRatio}×`,
+    t
+      ? `  實際：TITLE ${t.titles} 個、HEADING ${t.headings} 個、加粗 ${t.boldDrawn} 個、` +
+          `因層級不足而放大 ${t.sizeBoosted} 個、因空間不足觸到字級下限 ${t.floorApplied} 個`
+      : '  實際：—（請先產生 PDF）',
+    t ? `  標題∕內文最小字級比：${t.minHeadingBodyRatio || '—'}（需 ≥ ${TYPOGRAPHY.minHeadingBodyRatio}）` : '',
+    flat.length ? `  ⚠ ${flat.length} 個標題與內文字級差異仍不足` : '  ✓ 沒有標題被縮到與內文相近',
+    '',
+    `【上標引用重建】`,
+    `  來源偵測：${st.superscriptBlockCount} 個區塊共 ${st.superscriptMarkerCount} 個標記` +
+      `（其中 ${st.superscriptGluedCount} 個來自黏連文字後處理）`,
+    t
+      ? `  實際繪製：${t.superscriptRuns} 個，分布於 ${t.superscriptUnits} 個翻譯單元；` +
+          `補回被模型漏掉的句尾標記 ${t.superscriptRestored} 個`
+      : '  實際繪製：—（請先產生 PDF）',
+    `  樣式：字級 ${TYPOGRAPHY.superscript.scale}×、基線上移 ${TYPOGRAPHY.superscript.riseEm} em（不改變行高）`,
+    '',
+    `【段落縮排與間距】`,
+    `  首行縮排：BODY ${TYPOGRAPHY.body.firstLineIndentEm} em（標題∕圖表標題∕表格儲存格不套用）` +
+      (t ? `，實際套用 ${t.indentedParagraphs} 個段落` : ''),
+    `  段前∕段後：BODY ${TYPOGRAPHY.body.spaceBeforeEm}∕${TYPOGRAPHY.body.spaceAfterEm} em、` +
+      `HEADING ${TYPOGRAPHY.heading.spaceBeforeEm} em（下滑入標題上方空白，不壓縮字級）` +
+      (t ? `，實際套用 ${t.spacedParagraphs} 個單元` : ''),
+    `  間距上限：最多佔區塊高度 ${Math.round(TYPOGRAPHY.spacing.maxShare * 100)}%，標題下滑最多 ${TYPOGRAPHY.spacing.maxSlideEm} em`,
+    `  中英混排：中文與英文∕數字間一個空格；標點、百分比、單位、引用標記前不插空格；行首行尾不留空白`,
+    '',
+    `【句尾殘句（orphan fragment）】`,
+    `  合併回前一段：${st.orphanMergedCount} 個`,
+    `  仍未解決：${st.orphanUnresolvedCount} 個（找不到安全的所屬段落，維持原狀）`,
+  ];
+
+  if (render) {
+    const overflow = render.warnings.filter((r) => r.reason === 'TEXT_OVERFLOW' && r.typography);
+    const clipped = render.warnings.filter((r) => r.reason === 'PAGE_OVERFLOW');
+    lines.push(
+      '',
+      `【尚未解決的警告】`,
+      `  文字溢出區塊：${overflow.length} 個`,
+      `  落出頁面而未繪製：${clipped.length} 個`,
+    );
+    for (const r of overflow.slice(0, 12)) {
+      lines.push(`    ${r.unitId}  p${r.page}  ${r.type}  ${r.fontSize} → ${r.finalFontSize} pt  ${r.message ?? ''}`);
+    }
+  }
+
+  if (typographyDiagnosticsUnits.checked) {
+    lines.push('', '【標題明細】');
+    for (const r of headingReports) {
+      const ty = r.typography;
+      if (!ty) continue;
+      lines.push(
+        `  ${r.unitId}  p${r.page}  ${ty.role}  原 ${r.fontSize} pt → 起始 ${ty.startFontSize} pt → 繪製 ${r.finalFontSize} pt  ` +
+          `(${ty.bodyRatio}× body, 下限 ${ty.minFontSize} pt${ty.bold ? ', 加粗' : ''})`,
+      );
+    }
+    lines.push('', '【上標引用明細】');
+    for (const b of supBlocks.slice(0, 60)) {
+      lines.push(`  ${b.id}  p${b.page}  ${b.type}  標記 ${(b.superscripts ?? []).join(' / ')}`);
+    }
+    lines.push('', '【殘句合併明細】');
+    for (const b of orphanBlocks) {
+      lines.push(`  ${b.id}  p${b.page}  → ${b.orphanOf}  ${b.orphanReason ?? ''}
+    ${JSON.stringify(b.text.slice(0, 80))}`);
+    }
+  }
+
+  typographyDiagnosticsList.textContent = lines.filter((l) => l !== '').length ? lines.join('\n') : '';
+  typographyDiagnostics.hidden = false;
 }
 
 /**
@@ -715,6 +885,117 @@ tableDiagnosticsCells.addEventListener('change', () => {
   if (currentLayout) renderTableDiagnostics(currentLayout, lastRenderResult);
 });
 
+/**
+ * Developer Mode (繁體中文): the generic layout roles — structured abstract
+ * regions and their labels, sidebar / callout containers with their inner
+ * roles, background-aware masks, and the source-item ownership check.
+ */
+function renderLayoutRoleDiagnostics(layout: LayoutResult, render: RenderResult | null): void {
+  const st = layout.stats;
+  const lr = render?.stats.layoutRoles ?? null;
+  const regions = layout.structuredRegions;
+  const containers = layout.containers;
+  const labelBlocks = layout.blocks.filter((b) => roleOf(b) === 'STRUCTURED_LABEL');
+  const roleCount = (role: LayoutRole) => layout.blocks.filter((b) => roleOf(b) === role).length;
+  const box = (r: { x: number; y: number; width: number; height: number }) => `[${r.x}, ${r.y}, ${r.width}×${r.height}]`;
+  const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const avg = (values: number[]) => (values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0);
+  const claimedByDetector = layout.roleOwnership;
+
+  roleDiagnosticsSummary.textContent =
+    `版面角色診斷：結構式摘要 ${st.structuredRegionCount} 區（label ${st.structuredLabelCount} 個）` +
+    ` · 側欄 ${st.sidebarCount} · 重點框 ${st.calloutCount}（子區塊 ${st.sidebarChildCount}）` +
+    ` · 重複來源項目 ${st.duplicateSourceItems}` +
+    (lr ? ` · 容器底色遮罩 ${lr.containerMasks} · 白字 ${lr.lightTextUnits}` : '');
+
+  const lines: string[] = [
+    '【Structured Abstract（結構式摘要）】',
+    `  區域數：${regions.length}`,
+    `  label 數：${st.structuredLabelCount}（區塊角色 STRUCTURED_LABEL ${labelBlocks.length} 個）`,
+    `  平均 confidence：區域 ${pct(avg(regions.map((r) => r.confidence)))}，label ${pct(avg(regions.flatMap((r) => r.sections.map((s) => s.confidence))))}`,
+    `  section 數：${regions.reduce((n, r) => n + r.sections.length, 0)}`,
+    `  門檻：label ≥ ${pct(STRUCTURED_MIN_LABEL_CONFIDENCE)}、區域 ≥ ${pct(STRUCTURED_MIN_REGION_CONFIDENCE)}（低於門檻維持一般 BODY）`,
+  ];
+  for (const r of regions) {
+    lines.push(
+      `    ${r.id}  第 ${r.page} 頁  confidence ${pct(r.confidence)}  bbox ${box(r.bbox)}  ${r.sections.length} 個 section  [${r.signals.join(', ')}]`,
+    );
+    for (const s of r.sections) {
+      const label = layout.blocks.find((b) => b.id === s.labelBlock);
+      lines.push(
+        `      ${s.labelBlock}  ${s.inline ? '同行 run-in' : '獨立一行'}  confidence ${pct(s.confidence)}  正文 ${s.bodyBlocks.length} 塊  ${JSON.stringify(label?.text.slice(0, 40) ?? '')}`,
+      );
+    }
+  }
+  lines.push(
+    '',
+    '【Sidebar / Callout（側欄與重點框）】',
+    `  container 數：${containers.length}（側欄 ${st.sidebarCount}、重點框 ${st.calloutCount}）`,
+    `  平均 confidence：${pct(avg(containers.map((c) => c.confidence)))}（門檻 ≥ ${pct(SIDEBAR_MIN_CONFIDENCE)}）`,
+    `  children 數：${st.sidebarChildCount}`,
+    `  heading / label / body：${roleCount('SIDEBAR_HEADING')} / ${roleCount('SIDEBAR_LABEL')} / ${roleCount('SIDEBAR_BODY')}`,
+  );
+  for (const c of containers) {
+    lines.push(
+      `    ${c.id}  第 ${c.page} 頁  ${c.type === 'SIDEBAR' ? '側欄' : '重點框'}  bbox ${box(c.bbox)}  背景 ${c.backgroundFill ?? '無（白底）'}${c.textOnDark ? '（深色，白字）' : ''}` +
+        `  邊框 ${c.border ? `${c.border.source} ${c.border.thickness} pt` : '無'}  內距 ${c.padding.left}/${c.padding.right}/${c.padding.top}/${c.padding.bottom}` +
+        `  confidence ${pct(c.confidence)}  children ${c.children.length}  [${c.signals.join(', ')}]`,
+    );
+    const kids = c.children.map((id) => layout.blocks.find((b) => b.id === id)).filter((b): b is TextBlock => !!b);
+    lines.push(
+      `      heading ${kids.filter((b) => roleOf(b) === 'SIDEBAR_HEADING').length} · label ${kids.filter((b) => roleOf(b) === 'SIDEBAR_LABEL').length} · body ${kids.filter((b) => roleOf(b) === 'SIDEBAR_BODY').length}`,
+    );
+  }
+  lines.push(
+    '',
+    '【Ownership（來源歸屬）】',
+    `  claimed source items（側欄 / 結構式摘要角色所擁有的來源文字項目）：${st.roleClaimedSourceItems}`,
+    `  duplicate source items：${st.duplicateSourceItems}（必須為 0）`,
+    `  各 detector 擁有的區塊：${Object.entries(claimedByDetector).map(([k, v]) => `${k} ${v}`).join('、') || '—'}`,
+    `  優先順序：TABLE → FIGURE → SIDEBAR/CALLOUT → STRUCTURED ABSTRACT → CAPTION → BODY`,
+  );
+  lines.push(
+    '',
+    '【Typography / 背景遮罩】',
+    `  STRUCTURED_LABEL：起始 ${TYPOGRAPHY.structuredLabel.sizeScale}× body，下限 ${TYPOGRAPHY.structuredLabel.minScale}× body，加粗，段前 ${TYPOGRAPHY.spacing.structuredLabelBefore} em，label 後間距 ${TYPOGRAPHY.spacing.structuredLabelAfter} em，section 間距 ${TYPOGRAPHY.spacing.structuredSectionGap} em`,
+    `  SIDEBAR_HEADING：起始 ${TYPOGRAPHY.sidebarHeading.sizeScale}× 容器內文，下限 ${TYPOGRAPHY.sidebarHeading.minScale}×；SIDEBAR_LABEL 下限 ${TYPOGRAPHY.sidebarLabel.minScale}× 容器內文`,
+    `  最低對比：字級 / 字重 / 間距三者至少 ${TYPOGRAPHY.minimumHeadingBodyContrast.required} 項成立`,
+    lr
+      ? `  實際：結構式 label ${lr.structuredLabels}、側欄標題 ${lr.sidebarHeadings}、側欄 label ${lr.sidebarLabels}、側欄內文 ${lr.sidebarBodies}；` +
+          `同行 label ${lr.inlineLabels}、改為獨立一行 ${lr.ownLineLabels}、對比不足 ${lr.contrastShortfall}`
+      : '  實際：—（請先產生 PDF）',
+    lr
+      ? `  遮罩：容器底色 ${lr.containerMasks} 條、其他填色 ${lr.tintedMasks} 條、深底白字 ${lr.lightTextUnits} 個單元（遮罩只覆蓋字形範圍，不重畫容器與邊框）`
+      : '  遮罩：—（請先產生 PDF）',
+  );
+  if (roleDiagnosticsBlocks.checked) {
+    lines.push('', '【角色區塊明細】');
+    for (const b of layout.blocks) {
+      if (!b.roleDetector || (b.roleDetector !== 'sidebar' && b.roleDetector !== 'structured-abstract')) continue;
+      const report = render?.reports.find((r) => r.sourceBlockIds[0] === b.id);
+      lines.push(
+        `  ${b.id}  p${b.page}  ${ROLE_LABELS_ZH[roleOf(b)]} (${roleOf(b)})  confidence ${pct(b.roleConfidence ?? 1)}  bbox ${box(b)}` +
+          (b.containerId ? `  容器 ${b.containerId}` : '') +
+          (b.labelFor ? `  label→${b.labelFor}` : '') +
+          (report?.background ? `  背景 ${report.background.color ?? '白'}（${report.background.source}${report.background.light ? '，白字' : ''}）` : '') +
+          (report?.typography?.labelPlacement ? `  ${report.typography.labelPlacement === 'inline' ? '同行' : '獨立一行'}` : '') +
+          (report?.typography?.contrast ? `  對比 ${report.typography.contrast.join('+')}` : '') +
+          `  ${JSON.stringify(b.text.slice(0, 50))}`,
+      );
+    }
+  }
+  roleDiagnosticsList.textContent = lines.join('\n');
+  roleDiagnostics.hidden = false;
+}
+
+roleDiagnosticsBlocks.addEventListener('change', () => {
+  if (currentLayout) renderLayoutRoleDiagnostics(currentLayout, lastRenderResult);
+});
+
+typographyDiagnosticsUnits.addEventListener('change', () => {
+  if (currentLayout) renderTypographyDiagnostics(currentLayout, lastRenderResult);
+});
+
 function renderResults(analysis: PdfAnalysis, layout: LayoutResult | null): void {
   resFile.textContent = analysis.fileName;
   resPages.textContent = String(analysis.pageCount);
@@ -751,6 +1032,8 @@ function renderResults(analysis: PdfAnalysis, layout: LayoutResult | null): void
   debugLimitEl.textContent = String(Math.min(DEBUG_ITEM_LIMIT, analysis.textItemCount));
   toolbar.hidden = false;
   renderTableDiagnostics(layout, null);
+  renderTypographyDiagnostics(layout, null);
+  renderLayoutRoleDiagnostics(layout, null);
 
   if (layout.stats.translationBlockCount > 0) {
     testSection.hidden = false;
@@ -891,7 +1174,10 @@ clearSelectionBtn.addEventListener('click', () => {
 // Translation Test Mode
 // ---------------------------------------------------------------------------
 
-type TranslateAllOptions = Omit<DocumentTranslationOptions, 'client' | 'cache' | 'targetLanguage'>;
+type TranslateAllOptions = Omit<DocumentTranslationOptions, 'client' | 'cache' | 'targetLanguage'> & {
+  /** Scope fingerprint of this run (part of the terminology cache key); test runs pass their own. */
+  scopeKey?: string;
+};
 
 /**
  * Shared core: terminology extraction → translation (cache, batches, context,
@@ -902,25 +1188,42 @@ async function translateAll(
   into: Map<string, TranslationEntry>,
   options: TranslateAllOptions,
 ): Promise<TranslationStats> {
+  const { scopeKey, ...rest } = options;
+  const all = currentLayout?.translationBlocks ?? blocks;
+  // Terminology samples only the selected units (plus title / abstract); its per-session
+  // cache is keyed by document + scope, and auto terms of earlier scopes of the same
+  // document are merged in so every chapter uses the same renderings.
+  const documentKey = documentFingerprint(all);
   const result = await translateDocument(blocks, into, {
     client,
     cache,
     targetLanguage: TARGET_LANGUAGE,
-    documentOrder: currentLayout?.translationBlocks,
-    documentBlocks: currentLayout?.translationBlocks ?? blocks,
-    ...options,
+    documentOrder: all,
+    documentBlocks: unitsInDocumentOrder(all, blocks, terminologyContextUnits(all)),
+    terminologyDocumentKey: documentKey,
+    terminologyCacheKey: `${documentKey}|${scopeKey ?? 'all'}`,
+    ...rest,
   });
   const w = window as unknown as {
     __translations: Record<string, TranslationEntry>;
     __translationStats: TranslationStats;
     __qualityStats: Omit<DocumentTranslationResult, 'translation' | 'terms'>;
     __documentTerminology: DocumentTranslationResult['terms'];
+    __jobUsage: ReturnType<JobUsage['snapshot']>;
   };
+  // Per-job token accounting: the stage stats already include every retry (client
+  // batch retries and the Worker's missing-id retry), and a second run on the same
+  // file (Developer Mode test → full run) adds on top instead of replacing.
+  jobUsage.add('terminology', result.terminology.usage, result.terminology.durationMs);
+  jobUsage.add('translation', result.translation.usage, result.translation.durationMs);
+  jobUsage.add('qa', result.qa.usage, result.qa.durationMs);
+
   w.__translations = Object.fromEntries(into);
   w.__translationStats = result.translation;
   const { translation: _translation, terms, ...quality } = result;
   w.__qualityStats = quality;
   w.__documentTerminology = terms;
+  w.__jobUsage = jobUsage.snapshot();
   renderCostStats(result);
   renderTerminologyPanel(result);
   renderQaPanel(result, blocks, into);
@@ -996,10 +1299,12 @@ function sumUsage(parts: (WorkerUsage | null | undefined)[]): WorkerUsage | null
   let sum: WorkerUsage | null = null;
   for (const p of parts) {
     if (!p) continue;
-    sum = sum ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
-    sum.inputTokens += p.inputTokens;
-    sum.outputTokens += p.outputTokens;
-    sum.cachedInputTokens += p.cachedInputTokens;
+    const acc: WorkerUsage = sum ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+    acc.inputTokens += p.inputTokens;
+    acc.outputTokens += p.outputTokens;
+    acc.cachedInputTokens += p.cachedInputTokens;
+    acc.reasoningTokens += p.reasoningTokens;
+    sum = acc;
   }
   return sum;
 }
@@ -1047,6 +1352,12 @@ function renderCostStats(r: DocumentTranslationResult): void {
     `  QA corrected:     ${r.qa.correctedBlocks}`,
     `  Correction rate:  ${correctionRate(r.qa)}`,
     `  QA time:          ${(r.qa.durationMs / 1000).toFixed(1)}s · terminology time: ${(r.terminology.durationMs / 1000).toFixed(1)}s`,
+    '',
+    '--- Token Usage Summary (this job, actual provider usage) ---',
+    ...formatUsageBreakdown(jobUsage.snapshot()),
+    '',
+    '--- Translation Scope (this run) ---',
+    ...scopeRunLines(r),
   ];
   costStatsList.textContent = lines.join('\n');
   costStats.hidden = false;
@@ -1073,6 +1384,7 @@ async function runTest(): Promise<void> {
   try {
     await translateAll(blocks, entries, {
       userTerminology: terminology,
+      scopeKey: `test:${fnv1a([...selectedIds].sort().join(','))}`,
       maxBlocksPerBatch: TEST_MAX_BLOCKS,
       concurrency: 1,
       onProgress: (p) => setTestStatus(`${p.message}  (${p.blocksDone} / ${p.blocksTotal})`),
@@ -1176,7 +1488,7 @@ function updateTestEntry(entry: TranslationEntry): void {
 // Full translation (unlocked after the test)
 // ---------------------------------------------------------------------------
 
-async function runTranslation(blocks: TranslationBlock[]): Promise<void> {
+async function runTranslation(blocks: TranslationBlock[], scopeKey: string, retry = false): Promise<void> {
   if (!currentLayout || isTranslating || blocks.length === 0) return;
   if (!testOkCheckbox.checked) {
     setError('Run a translation test and confirm the quality before translating the full PDF.');
@@ -1184,6 +1496,7 @@ async function runTranslation(blocks: TranslationBlock[]): Promise<void> {
   }
   const terminology = currentTerminology();
   if (terminology === null) return;
+  if (!retry) startJob(); // one job (token counters) per scope run
 
   isTranslating = true;
   translateBtn.disabled = true;
@@ -1197,6 +1510,7 @@ async function runTranslation(blocks: TranslationBlock[]): Promise<void> {
   try {
     await translateAll(blocks, entries, {
       userTerminology: terminology,
+      scopeKey,
       onProgress: (p) => {
         setTranslateStatus(`${p.message}  (${p.blocksDone} / ${p.blocksTotal} blocks${p.blocksFailed ? `, ${p.blocksFailed} failed` : ''})`);
       },
@@ -1219,14 +1533,26 @@ async function runTranslation(blocks: TranslationBlock[]): Promise<void> {
 }
 
 translateBtn.addEventListener('click', () => {
-  if (!currentLayout) return;
-  void runTranslation(currentLayout.translationBlocks);
+  const scope = resolveCurrentScope();
+  if (!scope) return;
+  if (!scope.ok) {
+    setError(scope.error);
+    return;
+  }
+  lastScope = scope;
+  renderScopeDevPanel(scope);
+  void runTranslation(scope.units, scope.fingerprint);
 });
 
 retryBtn.addEventListener('click', () => {
   if (!currentLayout) return;
   const failedIds = new Set([...entries.values()].filter((e) => e.status === 'failed').map((e) => e.id));
-  void runTranslation(currentLayout.translationBlocks.filter((b) => failedIds.has(b.id)));
+  const units = lastScope?.ok ? lastScope.units : currentLayout.translationBlocks;
+  void runTranslation(
+    units.filter((b) => failedIds.has(b.id)),
+    lastScope?.fingerprint ?? 'all',
+    true,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1539,28 +1865,53 @@ function currentExportMode(): RenderOutput {
   return exportMode.value === 'translated' ? 'translated' : 'bilingual';
 }
 
-function rangeToPages(range: RenderRange): { pages: Set<number> | null; unitIds: Set<string> | null; label: string } {
-  if (!currentLayout || !currentAnalysis) return { pages: new Set([1]), unitIds: null, label: 'page 1' };
+interface RenderRangeSelection {
+  pages: Set<number> | null;
+  unitIds: Set<string> | null;
+  label: string;
+  /** File-name suffix for the exported range ("", "_p17", "_Methods_p5-8"). */
+  suffix: string;
+}
+
+function rangeToPages(range: RenderRange): RenderRangeSelection {
+  if (!currentLayout || !currentAnalysis) return { pages: new Set([1]), unitIds: null, label: 'page 1', suffix: '' };
   const pageCount = currentAnalysis.pageCount;
   switch (range) {
     case 'page1':
-      return { pages: new Set([1]), unitIds: null, label: 'page 1' };
+      return { pages: new Set([1]), unitIds: null, label: 'page 1', suffix: '' };
     case 'first3':
       return {
         pages: new Set([1, 2, 3].filter((p) => p <= pageCount)),
         unitIds: null,
         label: `first ${Math.min(3, pageCount)} pages`,
+        suffix: '',
       };
     case 'abstract': {
       const { ids } = findAbstractUnits(currentLayout, 50);
       const unitById = new Map(currentLayout.translationBlocks.map((u) => [u.id, u]));
       const pages = new Set<number>();
       for (const id of ids) for (const p of unitById.get(id)?.pages ?? []) pages.add(p);
-      return { pages: pages.size ? pages : new Set([1]), unitIds: new Set(ids), label: `abstract (${ids.length} units)` };
+      return { pages: pages.size ? pages : new Set([1]), unitIds: new Set(ids), label: `abstract (${ids.length} units)`, suffix: '' };
     }
-    default:
-      return { pages: null, unitIds: null, label: `all ${pageCount} pages` };
+    default: {
+      // Same export rule as User Mode: the scope's pages, or the whole document
+      // for 整份論文 / 保留完整 PDF. The overlay is always the last translated scope only.
+      const scope: TranslationScope = lastScope?.ok ? lastScope.scope : { mode: 'all' };
+      const output = resolveOutputPages(scope, chapterDetection?.chapters ?? [], pageCount, { keepFullDocument: scopeFull.checked });
+      return {
+        pages: output.pages ? new Set(output.pages) : null,
+        unitIds: scopeUnitIds(),
+        label: output.full ? `all ${pageCount} pages` : `${output.pages?.length ?? 0} page(s) — ${output.label}`,
+        suffix: output.fileSuffix,
+      };
+    }
   }
+}
+
+/** Unit ids of the last translated scope, null for the whole document (= no filter). */
+function scopeUnitIds(): Set<string> | null {
+  if (!lastScope || !lastScope.ok || lastScope.scope.mode === 'all') return null;
+  return new Set(lastScope.units.map((u) => u.id));
 }
 
 function showRenderWarnings(result: RenderResult): void {
@@ -1629,6 +1980,7 @@ async function buildPdf(o: BuildPdfOptions): Promise<BuiltPdf> {
     pages: o.pages,
     unitIds: o.unitIds,
     fonts,
+    debugRoles: roleDiagnosticsOverlay.checked,
     onProgress: o.onProgress,
   });
   // The Blob copies the bytes; the Uint8Array is dropped with `result`.
@@ -1643,7 +1995,7 @@ async function runGenerate(): Promise<void> {
   const mode: RenderMode = renderDebug.checked ? 'debug' : 'overlay';
   const output = currentExportMode();
   const range = renderRange.value as RenderRange;
-  const { pages, unitIds, label } = rangeToPages(range);
+  const { pages, unitIds, label, suffix } = rangeToPages(range);
 
   isGenerating = true;
   updateExportUi();
@@ -1678,12 +2030,15 @@ async function runGenerate(): Promise<void> {
     if (mode === 'overlay') {
       lastRenderResult = result;
       renderTableDiagnostics(currentLayout, result);
+      renderTypographyDiagnostics(currentLayout, result);
+      renderLayoutRoleDiagnostics(currentLayout, result);
     }
 
     generatedUrl = built.url;
+    const fileName = withOutputSuffix(result.fileName, suffix);
     downloadLink.href = generatedUrl;
-    downloadLink.download = result.fileName;
-    downloadLink.textContent = `Download ${result.fileName} (${formatBytes(built.size)})`;
+    downloadLink.download = fileName;
+    downloadLink.textContent = `Download ${fileName} (${formatBytes(built.size)})`;
     downloadLink.hidden = false;
 
     const seconds = ((performance.now() - started) / 1000).toFixed(1);
@@ -1695,6 +2050,7 @@ async function runGenerate(): Promise<void> {
         ? `Debug PDF ready (${label}): ${s.pagesRendered} ${pagesWord} with bounding boxes in ${seconds}s. ` +
             'Red = eligible block, blue = its lines, grey dashed = translated but not overlaid, green dashed = image, ' +
             'orange = table cell, purple = figure element (dashed: usable area)' +
+            (roleDiagnosticsOverlay.checked ? ', teal = sidebar / callout container (dashed: inner area), magenta = structured abstract region / label' : '') +
             (output === 'bilingual' ? '; boxes are drawn on the right half only.' : '.')
         : `Done (${label}, ${output === 'bilingual' ? 'side-by-side' : 'translated only'}) in ${seconds}s: ` +
             `${s.pagesRendered} ${pagesWord}, ${s.unitsWritten} unit(s) written, ${s.masksDrawn} lines masked, ` +
@@ -1732,8 +2088,14 @@ exportMode.addEventListener('change', updateExportUi);
 // User Mode: automatic analyze → translate → side-by-side bilingual PDF
 // ---------------------------------------------------------------------------
 
-type JobStep = 'read' | 'analyze' | 'terminology' | 'translate' | 'qa' | 'generate' | 'done';
-const JOB_STEPS: JobStep[] = ['read', 'analyze', 'terminology', 'translate', 'qa', 'generate', 'done'];
+type JobStep = 'read' | 'analyze' | 'scope' | 'terminology' | 'translate' | 'qa' | 'generate' | 'done';
+const JOB_STEPS: JobStep[] = ['read', 'analyze', 'scope', 'terminology', 'translate', 'qa', 'generate', 'done'];
+/**
+ * Before 開始翻譯 only the PDF is read and analysed, in the browser; the steps
+ * that spend tokens are not shown yet, so the progress card cannot be mistaken
+ * for a translation that already started.
+ */
+const ANALYSIS_STEPS: ReadonlySet<JobStep> = new Set<JobStep>(['read', 'analyze', 'scope']);
 
 /** Failures a general user can act on; the message never contains technical details. */
 class UserFacingError extends Error {
@@ -1770,16 +2132,22 @@ const MSG_OUT_OF_MEMORY = '這個 PDF 太大，瀏覽器記憶體不足，請關
 function resetJobUi(): void {
   jobCard.hidden = true;
   jobReset.hidden = true;
+  jobRescope.hidden = true;
   dropZone.hidden = false;
   uploadNote.hidden = false;
   jobProgress.hidden = false;
   jobDone.hidden = true;
   setText(jobNote, null);
+  setText(jobOutput, null);
+  jobUsageEl.hidden = true;
+  jobUsageEl.replaceChildren();
   setText(jobError, null);
   jobDownload.removeAttribute('href');
   jobDownload.removeAttribute('download');
   jobBar.value = 0;
   jobPercent.textContent = '0%';
+  jobTitle.textContent = '正在分析文件…';
+  jobPhase.hidden = false;
   for (const li of jobSteps.querySelectorAll('li')) li.classList.remove('is-active', 'is-done');
 }
 
@@ -1792,12 +2160,37 @@ function setJobProgress(step: JobStep, percent: number, label: string): void {
   jobBar.value = value;
   jobPercent.textContent = `${value}%`;
   jobStage.textContent = label;
+  const analysing = ANALYSIS_STEPS.has(step);
+  jobTitle.textContent = analysing ? '正在分析文件…' : '正在翻譯文件…';
+  jobPhase.hidden = !analysing;
   const current = JOB_STEPS.indexOf(step);
   for (const li of jobSteps.querySelectorAll<HTMLLIElement>('li')) {
-    const index = JOB_STEPS.indexOf(li.dataset.step as JobStep);
+    const stepName = li.dataset.step as JobStep;
+    const index = JOB_STEPS.indexOf(stepName);
+    li.hidden = analysing && !ANALYSIS_STEPS.has(stepName);
     li.classList.toggle('is-done', index < current || step === 'done');
     li.classList.toggle('is-active', index === current && step !== 'done');
   }
+}
+
+/**
+ * User Mode: the job's actual token usage and how long translating took.
+ * Hidden when no provider reported usage, so no estimate is ever shown.
+ */
+function renderJobUsage(): void {
+  const snapshot = jobUsage.snapshot();
+  console.log('[Token Usage] job summary', snapshot);
+  if (!jobUsage.hasUsage) {
+    jobUsageEl.hidden = true;
+    jobUsageEl.replaceChildren();
+    return;
+  }
+  const seconds = Math.max(1, Math.round(snapshot.totalDurationMs / 1000));
+  jobUsageEl.replaceChildren(
+    el('span', undefined, `本次 Token 使用量：${formatTokens(snapshot.totalProcessedTokens)}`),
+    el('span', undefined, `翻譯時間：${seconds} 秒`),
+  );
+  jobUsageEl.hidden = false;
 }
 
 function showDownloadButton(url: string, fileName: string, failedUnits: number): void {
@@ -1807,7 +2200,10 @@ function showDownloadButton(url: string, fileName: string, failedUnits: number):
   jobDownload.href = url;
   jobDownload.download = fileName;
   jobReset.hidden = false;
+  jobRescope.hidden = false;
   setText(jobNote, failedUnits > 0 ? `有 ${failedUnits} 段文字未能翻譯，已保留英文原文。` : null);
+  setText(jobOutput, lastOutput ? `輸出頁面：${lastOutput.label}` : null);
+  renderJobUsage();
 }
 
 function friendlyError(step: JobStep, err: unknown): string {
@@ -1821,14 +2217,14 @@ function friendlyError(step: JobStep, err: unknown): string {
 }
 
 /**
- * handleFileSelected → analyzePdf → (translation blocks) → translateAll →
- * buildPdf (side-by-side) → showDownloadButton. Same core functions as
- * Developer Mode; every await is followed by a check that this job is still
- * the current one, so a newer file always wins.
+ * User Mode, part 1: read + analyse the PDF (extraction → layout → tables →
+ * figures → final logical units), detect chapters, then show the translation
+ * scope and wait. Nothing is sent to the Worker here. Every await is
+ * followed by a check that this job is still the current one, so a newer
+ * file always wins.
  */
-async function runAutoPipeline(file: File, job: Job): Promise<void> {
+async function runAnalysisJob(file: File, job: Job): Promise<void> {
   const alive = () => job === currentJob && !job.controller.signal.aborted;
-  const jobEntries = entries; // fresh map from resetResults(); a newer job gets its own
   let step: JobStep = 'read';
 
   try {
@@ -1846,19 +2242,56 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
     currentPdfBytes = pdf.buffer;
     currentAnalysis = pdf.analysis;
     currentLayout = pdf.layout;
-    const layout = pdf.layout;
-    if (!pdf.analysis.hasSelectableText || !layout || layout.translationBlocks.length === 0) {
+    if (!pdf.analysis.hasSelectableText || !pdf.layout || pdf.layout.translationBlocks.length === 0) {
       throw new UserFacingError(MSG_UNSUPPORTED);
     }
+    void loadFontSet().catch(() => undefined); // warm the font download while the user picks the scope
+    setJobProgress('scope', 19, '請選擇翻譯範圍');
+    jobCard.hidden = true;
+    showScopeCard();
+  } catch (err) {
+    if (!alive()) return;
+    console.error(`[User Mode] ${step} failed`, err);
+    jobProgress.hidden = true;
+    jobCard.hidden = false;
+    jobReset.hidden = false;
+    setText(jobError, friendlyError(step, err));
+  } finally {
+    if (currentJob === job) currentJob = null;
+  }
+}
 
-    // Terminology → translate every eligible unit (TITLE / HEADING / BODY / CAPTION / FOOTNOTE;
-    // references stay English) → QA of high-risk units. Terminology / QA problems never stop the job.
-    step = 'translate';
+/**
+ * User Mode, part 2 (開始翻譯): terminology → translation → QA of the selected
+ * units only, then the complete side-by-side PDF: the Chinese overlay on the
+ * selected units, the original English everywhere else, no page dropped.
+ * Another scope of the same PDF reuses the analysis, the chapter map and the
+ * translation cache; the file is never read or analysed again.
+ */
+async function runTranslationJob(scope: ScopeResolution & { ok: true }): Promise<void> {
+  if (!currentPdfBytes || !currentAnalysis || !currentLayout || !currentFile) return;
+  const job = startJob(); // fresh abort controller and token counters for this scope run
+  const pdf: AnalyzedPdf & { layout: LayoutResult } = { buffer: currentPdfBytes, analysis: currentAnalysis, layout: currentLayout };
+  const file = currentFile;
+  const alive = () => job === currentJob && !job.controller.signal.aborted;
+  const jobEntries = entries; // shared per PDF: units translated for an earlier scope stay cached here
+  // Export page selection, decided before the run so the download line and the file name agree with it.
+  const output = resolveOutputPages(scope.scope, chapterDetection?.chapters ?? [], currentAnalysis.pageCount, {
+    keepFullDocument: scopeFull.checked,
+  });
+  lastScope = scope;
+  lastOutput = output;
+  renderScopeDevPanel(scope);
+  scopeCard.hidden = true;
+  resetJobUi();
+  let step: JobStep = 'translate';
+
+  try {
+    const blocks = scope.units;
     setJobProgress('terminology', 20, '正在分析專業術語...');
-    void loadFontSet().catch(() => undefined); // warm the font download while translating
-    const blocks = layout.translationBlocks;
     const stats = await translateAll(blocks, jobEntries, {
       signal: job.controller.signal,
+      scopeKey: scope.fingerprint,
       onStage: (stage) => {
         if (!alive()) return;
         if (stage === 'terminology') setJobProgress('terminology', 20, '正在分析專業術語...');
@@ -1886,13 +2319,16 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
     step = 'generate';
     setJobProgress('generate', 82, '正在產生中英對照 PDF...');
     const built = await buildPdf({
-      pdf: { ...pdf, layout },
+      pdf,
       fileName: file.name,
       entries: jobEntries,
       mode: 'overlay',
       output: 'bilingual',
-      pages: null,
-      unitIds: null,
+      // Whole document for 整份論文 and for 保留完整 PDF, otherwise exactly the pages of the scope.
+      pages: output.pages ? new Set(output.pages) : null,
+      // Only this run's units are overlaid. An earlier scope's translations stay in the cache
+      // (no new API call if they are selected again) but are never silently added to this file.
+      unitIds: new Set(blocks.map((u) => u.id)),
       onStatus: () => undefined,
       onProgress: (p) => {
         if (alive()) setJobProgress('generate', 84 + (15 * p.percent) / 100, '正在產生中英對照 PDF...');
@@ -1903,16 +2339,289 @@ async function runAutoPipeline(file: File, job: Job): Promise<void> {
       return;
     }
     if (built.fontNotes.length) console.warn('[fonts]', built.fontNotes.join('\n'));
+    if (generatedUrl) URL.revokeObjectURL(generatedUrl); // the previous scope run's PDF
     generatedUrl = built.url; // revoked by resetExport() when the next file is chosen
-    showDownloadButton(built.url, built.result.fileName, stats.failedBlocks);
+    showDownloadButton(built.url, withOutputSuffix(built.result.fileName, output.fileSuffix), stats.failedBlocks);
   } catch (err) {
     if (!alive()) return;
     console.error(`[User Mode] ${step} failed`, err);
     jobProgress.hidden = true;
     jobCard.hidden = false;
     jobReset.hidden = false;
+    jobRescope.hidden = false;
     setText(jobError, friendlyError(step, err));
   } finally {
     if (currentJob === job) currentJob = null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Translation scope (both modes): whole document / chapters / page range.
+// Chapter detection and scope resolution run in the browser on the final
+// logical units (scope/*.ts); no token is spent before 開始翻譯.
+// ---------------------------------------------------------------------------
+
+const MSG_SCOPE_EMPTY = '選取的範圍沒有可翻譯的內容。';
+
+function resetScopeUi(): void {
+  chapterDetection = null;
+  checkedChapterIds = new Set();
+  chapterTree.replaceChildren();
+  scopeChapterCount.textContent = '';
+  scopeStartInput.value = '';
+  scopeEndInput.value = '';
+  scopeStartInput.removeAttribute('max');
+  scopeEndInput.removeAttribute('max');
+  scopePageTotal.textContent = '';
+  for (const r of scopeModeInputs) r.checked = r.value === 'all';
+  scopeChaptersPanel.hidden = true;
+  scopePagesPanel.hidden = true;
+  scopeFull.checked = false;
+  scopeFullWrap.hidden = true;
+  scopeOutput.textContent = '';
+  lastOutput = null;
+  setText(scopeError, null);
+  scopeCard.hidden = true;
+  scopeDevSummary.textContent = 'Translation Scope';
+  scopeDevList.textContent = '';
+}
+
+function scopeMode(): TranslationScope['mode'] {
+  const checked = scopeModeInputs.find((r) => r.checked)?.value;
+  return checked === 'chapters' || checked === 'pages' ? checked : 'all';
+}
+
+/** The scope as the controls describe it; page numbers are validated by resolveTranslationScope(). */
+function currentScope(): TranslationScope {
+  switch (scopeMode()) {
+    case 'chapters':
+      return { mode: 'chapters', chapterIds: [...checkedChapterIds] };
+    case 'pages':
+      return { mode: 'pages', startPage: Number(scopeStartInput.value.trim()), endPage: Number(scopeEndInput.value.trim()) };
+    default:
+      return { mode: 'all' };
+  }
+}
+
+/** Resolve the scope on the final logical units; null before the analysis. */
+function resolveCurrentScope(): ScopeResolution | null {
+  if (!currentLayout || !currentAnalysis) return null;
+  return resolveTranslationScope(currentLayout.translationBlocks, chapterDetection?.chapters ?? [], currentScope(), {
+    pageCount: currentAnalysis.pageCount,
+    blocks: currentLayout.blocks,
+    pages: currentAnalysis.pages,
+  });
+}
+
+/** After the analysis: detect chapters (browser-side), fill the controls, show the card. */
+function showScopeCard(): void {
+  if (!currentAnalysis || !currentLayout) return;
+  chapterDetection = detectChapters(currentAnalysis, currentLayout);
+  checkedChapterIds = new Set();
+  renderChapterTree(chapterDetection);
+  const total = currentAnalysis.pageCount;
+  scopeStartInput.max = String(total);
+  scopeEndInput.max = String(total);
+  scopeStartInput.value = '1';
+  scopeEndInput.value = String(total);
+  scopePageTotal.textContent = `PDF 共 ${total} 頁（PDF 頁序，非印刷頁碼）`;
+  for (const r of scopeModeInputs) r.checked = r.value === 'all';
+  scopeCard.hidden = false;
+  console.log('[Translation Scope] chapters', chapterDetection);
+  updateScopeUi();
+}
+
+function renderChapterTree(detection: ChapterDetection): void {
+  chapterTree.replaceChildren();
+  if (detection.source === 'none' || detection.chapters.length === 0) {
+    scopeChapterCount.textContent = detection.warnings[0] ?? '此 PDF 無法可靠偵測章節，請改用整份論文或自訂頁數。';
+    chapterTree.hidden = true;
+    return;
+  }
+  chapterTree.hidden = false;
+  scopeChapterCount.textContent = `偵測到 ${detection.chapters.length} 個章節`;
+  const ids = new Set(detection.chapters.map((c) => c.id));
+  const byParent = new Map<string, ChapterInfo[]>();
+  const roots: ChapterInfo[] = [];
+  for (const c of detection.chapters) {
+    if (c.parentId && ids.has(c.parentId)) {
+      const list = byParent.get(c.parentId) ?? [];
+      list.push(c);
+      byParent.set(c.parentId, list);
+    } else roots.push(c);
+  }
+  const build = (list: ChapterInfo[]): HTMLUListElement => {
+    const ul = el('ul');
+    for (const c of list) {
+      const li = el('li');
+      const label = el('label');
+      const box = el('input') as HTMLInputElement;
+      box.type = 'checkbox';
+      box.value = c.id;
+      box.dataset.id = c.id;
+      box.addEventListener('change', () => onChapterToggle(c.id, box.checked));
+      label.appendChild(box);
+      label.appendChild(el('span', 'chapter-title', c.title));
+      label.appendChild(el('span', 'chapter-pages', chapterPageLabel(c)));
+      li.appendChild(label);
+      const children = byParent.get(c.id);
+      if (children?.length) li.appendChild(build(children));
+      ul.appendChild(li);
+    }
+    return ul;
+  };
+  chapterTree.appendChild(build(roots));
+}
+
+function chapterBox(id: string): HTMLInputElement | null {
+  return chapterTree.querySelector<HTMLInputElement>(`input[data-id="${CSS.escape(id)}"]`);
+}
+
+/** Standard checkbox tree: a parent ticks its subtree; children set their parent to all / none / indeterminate. */
+function onChapterToggle(id: string, on: boolean): void {
+  if (!chapterDetection) return;
+  const chapters = chapterDetection.chapters;
+  for (const sub of chapterSubtreeIds(chapters, id)) {
+    const box = chapterBox(sub);
+    if (!box) continue;
+    box.checked = on;
+    box.indeterminate = false;
+    if (on) checkedChapterIds.add(sub);
+    else checkedChapterIds.delete(sub);
+  }
+  let parentId = chapters.find((c) => c.id === id)?.parentId;
+  while (parentId) {
+    const pid = parentId;
+    const children = chapters.filter((c) => c.parentId === pid).map((c) => chapterBox(c.id));
+    const all = children.length > 0 && children.every((b) => b?.checked);
+    const some = children.some((b) => b?.checked || b?.indeterminate);
+    const box = chapterBox(pid);
+    if (box) {
+      box.checked = all;
+      box.indeterminate = !all && some;
+    }
+    if (all) checkedChapterIds.add(pid);
+    else checkedChapterIds.delete(pid);
+    parentId = chapters.find((c) => c.id === pid)?.parentId;
+  }
+  updateScopeUi();
+}
+
+/** Validate the controls, show the one error line, enable 開始翻譯, refresh the Developer Mode panel. */
+function updateScopeUi(): void {
+  const mode = scopeMode();
+  scopeChaptersPanel.hidden = mode !== 'chapters';
+  scopePagesPanel.hidden = mode !== 'pages';
+  const resolution = resolveCurrentScope();
+  let error: string | null = null;
+  if (resolution && !resolution.ok) {
+    const noChapters = !chapterDetection || chapterDetection.source === 'none';
+    // Nothing ticked yet is "not ready", not an error; the unavailable-chapters text is already shown in the list.
+    error = mode === 'chapters' && (noChapters || checkedChapterIds.size === 0) ? null : resolution.error;
+  } else if (resolution && resolution.ok && resolution.units.length === 0) {
+    error = MSG_SCOPE_EMPTY;
+  }
+  setText(scopeError, error);
+  scopeStartBtn.disabled = !resolution || !resolution.ok || resolution.units.length === 0 || isTranslating;
+
+  // Export page selection: only offered for a partial scope; the whole document is always written for 整份論文.
+  scopeFullWrap.hidden = mode === 'all';
+  if (mode === 'all') scopeFull.checked = false;
+  const output = currentOutputPages();
+  scopeOutput.textContent = output && !error ? `輸出頁面：${output.label}` : '';
+  renderScopeDevPanel(resolution);
+}
+
+/** The pages the download will contain for the controls as they stand; null before the analysis. */
+function currentOutputPages(): OutputPages | null {
+  if (!currentAnalysis) return null;
+  return resolveOutputPages(currentScope(), chapterDetection?.chapters ?? [], currentAnalysis.pageCount, {
+    keepFullDocument: scopeFull.checked,
+  });
+}
+
+for (const r of scopeModeInputs) r.addEventListener('change', updateScopeUi);
+scopeFull.addEventListener('change', updateScopeUi);
+scopeStartInput.addEventListener('input', updateScopeUi);
+scopeEndInput.addEventListener('input', updateScopeUi);
+scopeStartBtn.addEventListener('click', () => {
+  const scope = resolveCurrentScope();
+  if (!scope || !scope.ok || scope.units.length === 0) {
+    updateScopeUi();
+    return;
+  }
+  void runTranslationJob(scope);
+});
+scopeReset.addEventListener('click', () => fileInput.click());
+jobRescope.addEventListener('click', () => {
+  jobCard.hidden = true;
+  scopeCard.hidden = false;
+  updateScopeUi();
+});
+
+/** Developer Mode: mode, chapter source, detected / selected chapters, counts, fingerprint, ownership check. */
+function scopeDevLines(res: ScopeResolution | null): string[] {
+  const d = chapterDetection;
+  const lines: string[] = [];
+  if (!res) return ['(analyze a PDF first)'];
+  lines.push(`mode:                     ${res.scope.mode}`);
+  lines.push(`chapter source:           ${d ? d.source : '—'}${d && d.source !== 'none' ? ` (${d.chapters.length} detected)` : ''}`);
+  if (res.scope.mode === 'pages') lines.push(`selected page range:      ${res.scope.startPage}–${res.scope.endPage}`);
+  if (res.scope.mode === 'chapters') {
+    const wanted = new Set(res.scope.chapterIds);
+    const titles = (d?.chapters ?? []).filter((c) => wanted.has(c.id)).map((c) => `${c.title} (${c.id})`);
+    lines.push(`selected chapters:        ${titles.length ? titles.join(' | ') : '—'}`);
+  }
+  lines.push(`scope fingerprint:        ${res.fingerprint}`);
+  if (!res.ok) {
+    lines.push(`resolve error:            ${res.error}`);
+  } else {
+    const s = res.stats;
+    lines.push(
+      `selected units:           ${s.selectedUnits} / ${s.totalUnits} logical units  (pages ${s.selectedPages.length ? `${s.selectedPages[0]}–${s.selectedPages[s.selectedPages.length - 1]}` : '—'})`,
+      `  BODY ${s.body} · HEADING/TITLE ${s.heading} · CAPTION ${s.caption} · FOOTNOTE ${s.footnote} · TABLE_CELL ${s.tableCells} · FIGURE ${s.figureUnits} · other ${s.other}`,
+      `provider-bound units:     ${s.providerBound}  (selected units minus untranslatable text)`,
+      `selected chars:           ${s.selectedChars.toLocaleString()}`,
+      `boundary-expanded units:  ${s.boundaryExpanded}${s.boundaryExpanded ? `  [${[...res.boundaryExpandedIds].slice(0, 12).join(', ')}${res.boundaryExpandedIds.size > 12 ? ', …' : ''}]` : ''}`,
+      `numeric-only skipped:     ${s.numericSkipped}  (table / figure cells inside the scope, never sent)`,
+      `duplicate source items:   ${s.duplicateSourceItems}  (provider-bound selected units; must be 0)`,
+    );
+  }
+  if (d && d.chapters.length) {
+    lines.push('', 'detected chapters:');
+    for (const c of d.chapters) {
+      const anchor = `p.${c.startPage}${c.startY !== undefined ? ` y=${Math.round(c.startY)}` : ''} → p.${c.endPage ?? c.startPage}${c.endY !== undefined ? ` y=${Math.round(c.endY)}` : ' end'}`;
+      lines.push(`  ${'  '.repeat(c.level - 1)}[${c.level}] ${c.title}  ${chapterPageLabel(c)}  (${c.id}, ${c.source}, ${anchor}${c.references ? ', references' : ''})`);
+    }
+  }
+  if (d?.warnings.length) lines.push('', ...d.warnings.map((w) => `warning: ${w}`));
+  return lines;
+}
+
+function renderScopeDevPanel(res: ScopeResolution | null = lastScope ?? resolveCurrentScope()): void {
+  (window as unknown as { __translationScope: ScopeResolution | null; __chapters: ChapterDetection | null }).__translationScope = res;
+  (window as unknown as { __chapters: ChapterDetection | null }).__chapters = chapterDetection;
+  if (!DEBUG_MODE) return;
+  scopeDevSummary.textContent = res?.ok
+    ? `Translation Scope: ${res.fingerprint} · ${res.stats.selectedUnits} / ${res.stats.totalUnits} units · ${res.stats.boundaryExpanded} boundary-expanded · dup ${res.stats.duplicateSourceItems}`
+    : 'Translation Scope';
+  scopeDevList.textContent = scopeDevLines(res).join('\n');
+}
+
+/** Cost panel: the scope of the run that just finished plus its cache / skip counts. */
+function scopeRunLines(r: DocumentTranslationResult): string[] {
+  const res = lastScope;
+  if (!res || !res.ok) return ['scope:                   whole document (no scope resolution recorded)'];
+  const s = res.stats;
+  return [
+    `scope:                   ${res.fingerprint} (${res.scope.mode})`,
+    `selected units:          ${s.selectedUnits} / ${s.totalUnits}  (BODY ${s.body}, TABLE_CELL ${s.tableCells}, FIGURE ${s.figureUnits}, CAPTION ${s.caption})`,
+    `selected chars:          ${s.selectedChars.toLocaleString()}`,
+    `provider-bound units:    ${s.providerBound}`,
+    `cache hits:              ${r.translation.cachedBlocks}`,
+    `numeric skipped:         ${s.numericSkipped}`,
+    `duplicate source items:  ${s.duplicateSourceItems}`,
+    `boundary expanded:       ${s.boundaryExpanded}`,
+    `terminology:             ${r.terminology.cached ? 'reused (scope cache)' : `${r.terminology.requests} request(s)`} · ${r.terminology.samples} samples / ${r.terminology.sampleChars.toLocaleString()} chars`,
+  ];
 }

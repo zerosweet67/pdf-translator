@@ -16,8 +16,10 @@ import * as pdfjsLib from 'pdfjs-dist';
 // `vite dev` and in the production bundle (respecting `base`). This is what
 // prevents the classic "works locally, worker 404 on GitHub Pages" problem.
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import type { FilledRect, FrameRect, ImageBox, PageDebugInfo, PdfAnalysis, RuleLine, TextItemDebug } from './types';
+import type { FilledRect, FrameRect, ImageBox, OutlineNode, PageDebugInfo, PdfAnalysis, RuleLine, TextItemDebug } from './types';
+import { readOutline } from './outline';
 import { normalizeSymbolFontText } from './symbols';
+import { collectTextRuns, splitScriptRuns, type TextRun } from './textruns';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -67,6 +69,11 @@ export interface PageGraphics {
   rules: RuleLine[];
   fills: FilledRect[];
   frames: FrameRect[];
+  /**
+   * Every `showText` of the page, positioned (pdf/textruns.ts). Used to put
+   * back the sub/superscript runs PDF.js merges into their neighbours.
+   */
+  runs: TextRun[];
 }
 
 /** Thin straight paths up to this thickness (points) count as rules. */
@@ -199,6 +206,7 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy, view: number[]):
   );
 
   const opList = await page.getOperatorList({ annotationMode: pdfjsLib.AnnotationMode.DISABLE });
+  const runs = collectTextRuns(opList);
   const boxes: ImageBox[] = [];
   const rules: RuleLine[] = [];
   const fills: FilledRect[] = [];
@@ -359,7 +367,7 @@ async function collectPageGraphics(page: pdfjsLib.PDFPageProxy, view: number[]):
         }
     }
   }
-  return { images: boxes, rules, fills, frames };
+  return { images: boxes, rules, fills, frames, runs };
 }
 
 // Derive the text item types from PDF.js itself so we do not depend on
@@ -423,8 +431,16 @@ export async function extractPdf(
   let whitespaceItemCount = 0;
   let suspiciousItemCount = 0;
   let normalizedSymbolCount = 0;
+  let outline: OutlineNode[] = [];
+  let outlineWarnings: string[] = [];
 
   try {
+    // Native outline (bookmarks) for the chapter scope; never fatal and never sent anywhere.
+    const read = await readOutline(pdf, pdf.numPages);
+    outline = read.items;
+    outlineWarnings = read.warnings;
+    if (outlineWarnings.length) console.warn('[extractPdf] outline warnings:', outlineWarnings);
+
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 1 });
@@ -451,7 +467,7 @@ export async function extractPdf(
         return name;
       };
 
-      const pageItems: TextItemDebug[] = [];
+      let pageItems: TextItemDebug[] = [];
 
       for (const raw of textContent.items) {
         if (!isTextItem(raw)) continue; // skip marked-content markers
@@ -490,12 +506,18 @@ export async function extractPdf(
       // Image placement for the overlay phase, table rules and fills for the
       // table renderer. Never fatal: a page whose operator list cannot be read
       // simply reports none.
-      let graphics: PageGraphics = { images: [], rules: [], fills: [], frames: [] };
+      let graphics: PageGraphics = { images: [], rules: [], fills: [], frames: [], runs: [] };
       try {
         graphics = await collectPageGraphics(page, page.view);
       } catch (err) {
         console.warn(`[extractPdf] image / rule detection failed on page ${pageNumber}:`, err);
       }
+
+      // PDF.js merges a sub/superscript run into the item next to it when the
+      // baseline moves only a little, which loses its size and position. The
+      // operator list still has both, so the merged items are split again
+      // wherever the runs account for them exactly (pdf/textruns.ts).
+      pageItems = splitScriptRuns(pageItems, graphics.runs);
 
       // Late font names, then Symbol-font PUA normalization (U+F05B → "[", U+F044 → Δ, ...).
       for (const item of pageItems) {
@@ -557,5 +579,7 @@ export async function extractPdf(
     suspiciousItemCount,
     suspiciousRatio,
     normalizedSymbolCount,
+    outline,
+    outlineWarnings,
   };
 }

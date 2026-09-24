@@ -132,6 +132,29 @@ export interface PdfAnalysis {
   suspiciousRatio: number;
   /** Symbol-font Private Use Area characters converted to Unicode (see symbols.ts). */
   normalizedSymbolCount: number;
+  /**
+   * The PDF's native outline (bookmarks) with every destination resolved to a
+   * page and, when the destination carries one, a Y anchor (pdf/outline.ts).
+   * Empty when the PDF has no outline. Optional so fixtures need not set it.
+   */
+  outline?: OutlineNode[];
+  /** Outline items whose destination could not be resolved (Developer Mode). */
+  outlineWarnings?: string[];
+}
+
+/**
+ * One outline (bookmark) entry, destination already resolved. `page` is the
+ * 1-based PDF page index (not the printed page number); `y` is the anchor in
+ * PDF user space (points, origin bottom-left) when the destination has one
+ * (/XYZ, /FitH, /FitR), null otherwise. `page` is null when the destination
+ * could not be resolved; the entry is then ignored by chapter detection but
+ * its children are still used.
+ */
+export interface OutlineNode {
+  title: string;
+  page: number | null;
+  y: number | null;
+  children: OutlineNode[];
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +224,89 @@ export type DetailedBlockType =
   | 'APPENDIX_HEADING'
   | 'APPENDIX_BODY';
 
+/**
+ * Generic layout role of a block (pdf/roles.ts). `type` keeps driving the
+ * legacy pipelines (merging, overlay eligibility); `role` refines how a block
+ * is translated (short per-role guidance) and rendered (typography, container
+ * aware masking). Every block carries one; the default is derived from `type`.
+ */
+export type LayoutRole =
+  | 'BODY'
+  | 'HEADING'
+  | 'STRUCTURED_LABEL'
+  | 'SIDEBAR'
+  | 'CALLOUT_BOX'
+  | 'SIDEBAR_HEADING'
+  | 'SIDEBAR_LABEL'
+  | 'SIDEBAR_BODY'
+  | 'CAPTION'
+  | 'TABLE'
+  | 'FIGURE'
+  | 'FOOTNOTE'
+  | 'REFERENCE';
+
+/** Container kinds a layout detector can produce (pdf/detectors/). */
+export type LayoutContainerType = 'SIDEBAR' | 'CALLOUT_BOX';
+
+/**
+ * A container that owns several text blocks: a shaded sidebar, an outlined
+ * callout box. Detected by pdf/detectors/sidebar.ts; its children carry
+ * `containerId` and one of the SIDEBAR_* roles. The container itself is
+ * never a translation unit and its vector graphics are never redrawn.
+ */
+export interface LayoutContainer {
+  /** "p{page}-c{index}". */
+  id: string;
+  type: LayoutContainerType;
+  page: number;
+  bbox: Rect;
+  /** Fill colour of the panel ("#f4f3ec"), null for a plain / white panel. */
+  backgroundFill: string | null;
+  /** Outline: a stroked frame or the rules that box the panel, null when there is none. */
+  border: { thickness: number; source: 'frame' | 'rules' } | null;
+  /** Inner usable area: bbox inset by the padding. */
+  padding: { left: number; right: number; top: number; bottom: number };
+  /** Ids of the child blocks, in reading order. */
+  children: string[];
+  /** 0–1, from the detector's signals (only containers above the threshold are kept). */
+  confidence: number;
+  /** Which signals fired, for Developer Mode. */
+  signals: string[];
+  /** Detector that produced it. */
+  detector: string;
+  /** Dominant body font size of the children (points), the typographic reference inside the panel. */
+  bodyFontSize: number;
+  /** True when the fill is dark enough that text inside is drawn in white. */
+  textOnDark: boolean;
+}
+
+/** One label + body pair of a structured abstract (pdf/detectors/structuredAbstract.ts). */
+export interface StructuredSection {
+  /** Id of the STRUCTURED_LABEL block. */
+  labelBlock: string;
+  /** Ids of the body blocks that follow the label, in reading order. */
+  bodyBlocks: string[];
+  bbox: Rect;
+  /** True when the label opens the first line of its paragraph (run-in label). */
+  inline: boolean;
+  /** 0–1 label confidence. */
+  confidence: number;
+  signals: string[];
+}
+
+/** A structured abstract: several label + body sections with one label style. */
+export interface StructuredAbstractRegion {
+  /** "p{page}-sa{index}". */
+  id: string;
+  page: number;
+  bbox: Rect;
+  sections: StructuredSection[];
+  /** 0–1 region confidence (only regions above the threshold are kept). */
+  confidence: number;
+  signals: string[];
+  detector: string;
+}
+
 /** A visual line: text items sharing one baseline and horizontally adjacent. */
 export interface TextLine {
   page: number;
@@ -263,6 +369,45 @@ export interface TextBlock {
    * and drawn by the table-only path of the renderer.
    */
   cell?: TableCellInfo;
+  /**
+   * Superscript runs found in this block: citation markers ("62",
+   * "16,27-29") and exponents, in the order they appear (pdf/superscript.ts),
+   * each with the identifier it followed. The renderer raises them again in
+   * the translation; the block text itself is untouched, so the translation
+   * input and its cache key do not change.
+   */
+  superscripts?: ScriptRun[];
+  /**
+   * Subscript runs found in this block (the "2" of H2O, the "p" of np2), in
+   * the order they appear (pdf/superscript.ts). Recovered from the operator
+   * list by pdf/textruns.ts when PDF.js merged them into their neighbour.
+   */
+  subscripts?: ScriptRun[];
+  /**
+   * Set on a sentence-tail fragment that pdf/paragraph.ts attached to an
+   * earlier paragraph: the id of the block it belongs to. Such a block is
+   * never a translation unit of its own.
+   */
+  orphanOf?: string;
+  /** Why the orphan detector attached it, for Developer Mode. */
+  orphanReason?: string;
+  /** Generic layout role (pdf/roles.ts); absent = the default role of `type` (see roleOf()). */
+  role?: LayoutRole;
+  /** Container (sidebar / callout) that owns this block, when any. */
+  containerId?: string;
+  /**
+   * Structured / sidebar label: the body block the label introduces. Set on
+   * a STRUCTURED_LABEL / SIDEBAR_LABEL block that was split off the first
+   * line of its paragraph (run-in label); the renderer draws the label and
+   * that body on one first line.
+   */
+  labelFor?: string;
+  /** Body block: the run-in label block that opens its first line. */
+  labelBlockId?: string;
+  /** Which detector assigned the role, for Developer Mode. */
+  roleDetector?: string;
+  /** 0–1 confidence of the role assignment (1 for the default role). */
+  roleConfidence?: number;
 }
 
 /** Horizontal alignment of a table cell, taken from its column. */
@@ -274,6 +419,35 @@ export interface Rect {
   y: number;
   width: number;
   height: number;
+}
+
+/**
+ * A raised or lowered run together with the identifier it hangs off.
+ *
+ * A script run is rarely a word of its own — it is the "p" of np2, the "2" of
+ * H2O, the "1" of FEV1, the exponent of np2 — so on its own it cannot be
+ * found again in the translation without moving every stray letter or digit.
+ * `anchor` is the identifier that immediately preceded it on its source line;
+ * the renderer looks for the two together.
+ */
+export interface ScriptRun {
+  /** The run's own text ("p", "2", "1,16", "62"). */
+  text: string;
+  /** The identifier it directly followed on the source line ("n", "H", "FEV"); empty when it had none. */
+  anchor: string;
+}
+
+/**
+ * One run of translated text that shares a single vertical position: either
+ * ordinary text or a raised citation marker. Produced by pdf/inline.ts,
+ * wrapped by pdf/fit.ts and drawn by pdf/render.ts.
+ */
+export interface InlineSegment {
+  text: string;
+  /** Draw smaller and raised above the baseline (pdf/typography.ts). */
+  sup: boolean;
+  /** Draw smaller and lowered below the baseline; mutually exclusive with `sup`. */
+  sub?: boolean;
 }
 
 /**
@@ -382,12 +556,28 @@ export interface LayoutResult {
   tables: TableSummary[];
   /** Detected figures (caption + vector cluster) and how their text elements were resolved. */
   figures: FigureSummary[];
+  /** Sidebar / callout containers (pdf/detectors/sidebar.ts). */
+  containers: LayoutContainer[];
+  /** Structured abstract regions (pdf/detectors/structuredAbstract.ts). */
+  structuredRegions: StructuredAbstractRegion[];
+  /** Per-detector ownership ledger: detector name → number of blocks it claimed. */
+  roleOwnership: Record<string, number>;
   stats: {
     lineCount: number;
     blockCount: number;
     translationBlockCount: number;
     /** Translation units that combine 2–3 layout blocks. */
     mergedBlockCount: number;
+    /** Sentence-tail fragments absorbed into the preceding paragraph (pdf/paragraph.ts). */
+    orphanMergedCount: number;
+    /** Fragment-looking blocks the orphan detector left alone (no safe owner). */
+    orphanUnresolvedCount: number;
+    /** Superscript citation markers found across the document (pdf/superscript.ts). */
+    superscriptMarkerCount: number;
+    /** Layout blocks that carry at least one superscript citation marker. */
+    superscriptBlockCount: number;
+    /** Markers found only by the glued-text fallback (weaker evidence). */
+    superscriptGluedCount: number;
     /** Translation units whose text still looks cut off after merging. */
     incompleteBlockCount: number;
     twoColumnPages: number;
@@ -418,12 +608,25 @@ export interface LayoutResult {
     figureNumericCells: number;
     /** Figures whose text could not be separated (kept in English). */
     figureUnresolvedCount: number;
+    /** Vertical bands of a two-column page a full-width table occupies (pdf/layout.ts). */
+    tableBandCount: number;
+    /** Blocks inside such a band that the table pipeline did not claim; kept out of the translation. */
+    tableBandSuppressed: number;
     /**
      * Source text items claimed by more than one block after tables and
      * figures were resolved. Must be 0; a non-zero value means a text item
      * would be translated (and masked) twice.
      */
     duplicateSourceItems: number;
+    /** Structured abstract regions / labels found (pdf/detectors/structuredAbstract.ts). */
+    structuredRegionCount: number;
+    structuredLabelCount: number;
+    /** Sidebar / callout containers and their children (pdf/detectors/sidebar.ts). */
+    sidebarCount: number;
+    calloutCount: number;
+    sidebarChildCount: number;
+    /** Source text items owned by blocks with a detector-assigned role. */
+    roleClaimedSourceItems: number;
   };
 }
 
@@ -446,6 +649,10 @@ export interface TranslationBlock {
   /** sectionType / blockType of the first source block, for debugging. */
   sectionType: SectionType;
   blockType: DetailedBlockType;
+  /** Layout role of the first source block (pdf/roles.ts); absent = the default role of `type`. */
+  role?: LayoutRole;
+  /** Sidebar / callout container of the source blocks, when any. */
+  containerId?: string;
   /** Text to translate: source texts joined with hyphenation repaired. */
   text: string;
   /** Layout block ids this translation covers, in reading order. */
@@ -453,6 +660,16 @@ export interface TranslationBlock {
   wasMerged: boolean;
   /** Human-readable explanation of each merge step, null when not merged. */
   mergeReason: string | null;
+  /** Source block ids that were absorbed as sentence-tail fragments (pdf/paragraph.ts). */
+  orphanFragmentIds?: string[];
+  /**
+   * Superscript runs of the source blocks ("62", "16,27-29", exponents), in
+   * order. The renderer uses them to raise the same runs in the translation;
+   * `text` (and therefore the cache key) is unaffected.
+   */
+  superscripts?: ScriptRun[];
+  /** Subscript runs of the source blocks, in order. */
+  subscripts?: ScriptRun[];
   /** True when the text still does not end a sentence after merging. */
   incompleteSource: boolean;
   /**
@@ -469,6 +686,23 @@ export interface TranslationBlock {
   overlayEligible?: boolean;
   /** Why the unit is not overlaid ("TYPE_FOOTNOTE", "IMAGE_OVERLAP", ...), null when eligible. */
   overlaySkippedReason?: string | null;
+  /**
+   * Where the unit starts and ends on the page(s), for the translation scope
+   * (scope/scope.ts): top of the first source block and bottom of the last
+   * one. Set by buildTranslationBlocks(); fixtures may leave it out, the scope
+   * then falls back to `pages`.
+   */
+  span?: UnitSpan;
+}
+
+/** Page + Y extent of a translation unit in PDF user space (y grows upward). */
+export interface UnitSpan {
+  startPage: number;
+  /** Top edge of the first source block. */
+  startY: number;
+  endPage: number;
+  /** Bottom edge of the last source block. */
+  endY: number;
 }
 
 /** `skipped`: needs no translation (number, DOI, URL, ...); kept as it is and never sent. */

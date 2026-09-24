@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const providerTranslate = vi.fn(async (blocks: { id: string; text: string }[]) => ({
   blocks: blocks.map((b) => ({ id: b.id, translation: `譯:${b.text}` })),
   model: 'mock-model',
-  usage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 },
+  usage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0, reasoningTokens: 0 },
 }));
 const createProvider = vi.fn(() => ({ name: 'mock', model: 'mock-model', translate: providerTranslate }));
 

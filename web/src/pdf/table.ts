@@ -47,6 +47,11 @@ const WORD_GAP = 0.12;
 /** Column bands are separated by an empty x-gap at least this wide (points, or × font size). */
 const MIN_COLUMN_GAP_PT = 3;
 const MIN_COLUMN_GAP_RATIO = 0.35;
+/** A shaded column must repeat over this many rows before it is read as the table's grid. */
+const FILL_COLUMN_MIN_ROWS = 2;
+/** ...and the grid needs at least this many columns and this share of the table's width. */
+const FILL_COLUMN_MIN_COUNT = 3;
+const FILL_COLUMN_MIN_COVERAGE = 0.7;
 /** Superscript: this much smaller than the row font and raised by at least SUPERSCRIPT_RAISE × row font. */
 const SUPERSCRIPT_SIZE = 0.8;
 const SUPERSCRIPT_RAISE = 0.12;
@@ -390,8 +395,12 @@ function detectBands(rows: readonly Row[]): Band[] {
   if (candidates.length === 0) return [];
   const fs = median(candidates.map((r) => r.fontSize)) || 10;
   const minGap = Math.max(MIN_COLUMN_GAP_PT, MIN_COLUMN_GAP_RATIO * fs);
+  // Projected over the *items*, not the fragments: two value columns that sit
+  // closer than FRAGMENT_GAP ("6.94 ± 0.6" then "0.78 ± 0.2") are one
+  // fragment, and projecting that fragment would bury the gutter between them
+  // and merge the two columns into one cell.
   const intervals = candidates
-    .flatMap((r) => r.fragments.map((f) => ({ left: f.x, right: f.right })))
+    .flatMap((r) => r.fragments.flatMap((f) => f.items.map((i) => ({ left: i.item.x, right: i.item.x + i.item.width }))))
     .sort((a, b) => a.left - b.left);
   const bands: Band[] = [];
   for (const iv of intervals) {
@@ -399,6 +408,54 @@ function detectBands(rows: readonly Row[]): Band[] {
     if (last && iv.left - last.right < minGap) last.right = Math.max(last.right, iv.right);
     else bands.push({ left: iv.left, right: iv.right });
   }
+  return bands;
+}
+
+/**
+ * Column bands from the shaded cell backgrounds of the table.
+ *
+ * Where the producer fills the cells, the fills carry the exact grid — including
+ * the gutters the text cannot show, because two value columns are regularly
+ * emitted as a single text run ("6.94 ± 0.6 0.78 ± 0.2") and no projection of
+ * that run can separate them again.
+ *
+ * Accepted only when the fills really tile the table: the same column repeated
+ * over several rows, at least FILL_COLUMN_MIN_COUNT of them, covering most of
+ * the width the text occupies. Anything else (a single highlighted row, a
+ * shaded page background) falls back to the projection in detectBands().
+ */
+function bandsFromFills(fills: readonly FilledRect[], rows: readonly Row[]): Band[] {
+  if (fills.length === 0) return [];
+  const fontSize = median(rows.map((r) => r.fontSize)) || 10;
+  const top = Math.max(...rows.map((r) => r.y)) + fontSize;
+  const bottom = Math.min(...rows.map((r) => r.y)) - fontSize;
+  const left = Math.min(...rows.flatMap((r) => r.fragments.map((f) => f.x)));
+  const right = Math.max(...rows.flatMap((r) => r.fragments.map((f) => f.right)));
+
+  const counts = new Map<string, { band: Band; rows: Set<number> }>();
+  for (const f of fills) {
+    if (f.y > top || f.y + f.height < bottom) continue;
+    if (f.width <= 0 || f.height <= 0) continue;
+    const key = `${Math.round(f.x * 2)}:${Math.round((f.x + f.width) * 2)}`;
+    const entry = counts.get(key) ?? { band: { left: f.x, right: f.x + f.width }, rows: new Set<number>() };
+    entry.rows.add(Math.round(f.y * 2));
+    counts.set(key, entry);
+  }
+
+  const repeated = [...counts.values()]
+    .filter((e) => e.rows.size >= FILL_COLUMN_MIN_ROWS)
+    .map((e) => e.band)
+    .sort((a, b) => a.left - b.left || b.right - a.right);
+  // A row-spanning fill is often drawn over its own cells as well; keep the
+  // finest partition by dropping every interval that contains another one.
+  const bands = repeated.filter(
+    (b) => !repeated.some((o) => o !== b && o.left >= b.left - 0.5 && o.right <= b.right + 0.5 && o.right - o.left < b.right - b.left - 0.5),
+  );
+  if (bands.length < FILL_COLUMN_MIN_COUNT) return [];
+  // The grid must not overlap itself, and it must cover the text.
+  for (let i = 1; i < bands.length; i++) if (bands[i].left < bands[i - 1].right - 1) return [];
+  const covered = bands.reduce((sum, b) => sum + Math.max(0, Math.min(b.right, right) - Math.max(b.left, left)), 0);
+  if (covered < FILL_COLUMN_MIN_COVERAGE * (right - left)) return [];
   return bands;
 }
 
@@ -843,22 +900,23 @@ export function buildTableCells(input: TableInput): TableBuildResult {
   const rows = buildRows(refs);
   if (rows.length < 2) return { ok: false, reason: 'SINGLE_ROW' };
 
-  const bands = detectBands(rows);
-  if (bands.length < 2) return { ok: false, reason: 'NO_COLUMNS' };
+  const shaded = bandsFromFills(input.fills, rows);
+  const grid = shaded.length >= FILL_COLUMN_MIN_COUNT ? shaded : detectBands(rows);
+  if (grid.length < 2) return { ok: false, reason: 'NO_COLUMNS' };
 
   for (const row of rows) {
-    row.fragments = row.fragments.flatMap((f) => resplitAtGutters(f, bands, row));
-    for (const f of row.fragments) assignColumns(f, bands);
+    row.fragments = row.fragments.flatMap((f) => resplitAtGutters(f, grid, row));
+    for (const f of row.fragments) assignColumns(f, grid);
     mergeSameColumn(row);
   }
   const allFragments = rows.flatMap((r) => r.fragments);
   const tableLeft = Math.min(...allFragments.map((f) => f.x));
   const tableRight = Math.max(...allFragments.map((f) => f.right));
   const firstDataRow = findFirstDataRow(rows);
-  const drafts = buildCells(rows, firstDataRow, input.rules, bands.length);
+  const drafts = buildCells(rows, firstDataRow, input.rules, grid.length);
 
   // Column alignment from single-column data cells.
-  const alignments: CellAlignment[] = bands.map((_, c) => {
+  const alignments: CellAlignment[] = grid.map((_, c) => {
     const samples = drafts
       .filter((d) => d.colStart === c && d.colEnd === c && d.rows[0] >= firstDataRow)
       .map((d) => textBoxOf(d.fragments))
@@ -873,7 +931,7 @@ export function buildTableCells(input: TableInput): TableBuildResult {
     const textBox = textBoxOf(draft.fragments);
     const fontSize = dominantFontSize(draft.fragments.flatMap((f) => f.items.map((r) => r.item)));
     const yRange = { top: textBox.y + textBox.height, bottom: textBox.y };
-    const cols = columnBounds(draft.colStart, draft.colEnd, bands, input.rules, tableLeft, tableRight, yRange);
+    const cols = columnBounds(draft.colStart, draft.colEnd, grid, input.rules, tableLeft, tableRight, yRange);
     const vertical = rowBounds(textBox, fontSize, fragmentSet, allFragments, input.rules, cols);
     const usableLeft = Math.min(cols.left + CELL_PAD_X, textBox.x);
     const usableRight = Math.max(cols.right - CELL_PAD_X, textBox.x + textBox.width);
@@ -918,7 +976,7 @@ export function buildTableCells(input: TableInput): TableBuildResult {
     });
   }
   cells.sort((a, b) => a.info.rowIndex - b.info.rowIndex || a.info.columnIndex - b.info.columnIndex);
-  return { ok: true, cells, rows: rows.length, columns: bands.length };
+  return { ok: true, cells, rows: rows.length, columns: grid.length };
 }
 
 // ---------------------------------------------------------------------------

@@ -58,6 +58,7 @@ interface ResponsesReply {
     input_tokens?: number;
     output_tokens?: number;
     input_tokens_details?: { cached_tokens?: number };
+    output_tokens_details?: { reasoning_tokens?: number };
   };
   error?: { message?: string; type?: string; code?: string } | null;
 }
@@ -215,11 +216,14 @@ export class OpenAIProvider implements TranslationProvider {
       throw new ProviderError(502, 'invalid_json', 'Model returned invalid JSON.');
     }
 
+    // Actual provider counts only; the Responses API reports cached prompt tokens
+    // inside input_tokens and reasoning tokens inside output_tokens.
     const usage = reply.usage
       ? {
           inputTokens: reply.usage.input_tokens ?? 0,
           outputTokens: reply.usage.output_tokens ?? 0,
           cachedInputTokens: reply.usage.input_tokens_details?.cached_tokens ?? 0,
+          reasoningTokens: reply.usage.output_tokens_details?.reasoning_tokens ?? 0,
         }
       : undefined;
     return { parsed, model: reply.model ?? this.model, usage };

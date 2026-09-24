@@ -142,13 +142,18 @@ The first screen asks for the invite code.
 Enter invite code
 → Select PDF
 → Read PDF
-→ Analyze layout
-→ Analyze terminology (one call)
-→ Translate
-→ Check translation quality (high-risk blocks only)
-→ Generate bilingual PDF
-→ Download
+→ Analyze layout (tables, figures, final logical units)
+→ Detect chapters (PDF outline, else headings; browser-side, no API call)
+→ Choose the translation scope: whole document / chapters / page range
+→ 開始翻譯
+→ Analyze terminology (one call, selected units only)
+→ Translate (selected units only)
+→ Check translation quality (high-risk blocks of the selection only)
+→ Generate the full bilingual PDF (Chinese overlay on the selected units)
+→ Download, or pick another scope of the same PDF (no re-analysis)
 ```
+
+Nothing is sent to the Worker before 開始翻譯 is pressed.
 
 User Mode is intentionally simple. Developer controls are hidden unless the URL contains:
 
@@ -161,6 +166,77 @@ Example:
 ```text
 http://localhost:5173/?debug=true
 ```
+
+## Translation Scope
+
+After the analysis the app shows **翻譯範圍** with three options (default: 整份論文):
+
+| Mode | What is translated |
+| --- | --- |
+| 整份論文 (whole document) | every translatable final logical unit, exactly as before |
+| 選擇章節 (chapter selection) | the units inside the ticked chapters (checkbox tree; a parent ticks its children, a partly ticked parent shows indeterminate) |
+| 自訂頁數 (custom page range) | the units of PDF pages *start*–*end* (1-based PDF page index, not the printed page number; validated: `1 ≤ start ≤ end ≤ pages`) |
+
+The download follows the scope: 整份論文 gives the whole document, the other two give
+the pages of the selection unless **保留完整 PDF** is ticked (see below).
+
+How it works (`web/src/scope/`, `web/src/pdf/outline.ts`):
+
+- **Chapter detection is browser-side and never calls the API.** The PDF's native
+  outline (bookmarks) comes first: `pdf.getOutline()` is read with every destination
+  resolved (named destinations, explicit `/XYZ` / `/FitH` / `/FitR` arrays, nested
+  items); an item whose destination cannot be resolved is skipped on its own, its
+  children are kept. Anchors are page + Y, so two chapters on one page are separated.
+  Without an outline the HEADING units of the final layout are used (level from the
+  numbering `3.1` → 2, common academic titles such as *Abstract / Methods / Results /
+  Discussion / References* → level 1, otherwise a conservative font-size guess, else
+  level 1). If neither is reliable the chapter mode says so and the other two modes
+  keep working. *References* is listed but unticked by default; ticking it changes
+  nothing, reference entries are never translated.
+- A chapter runs from its anchor to the anchor of the next chapter of the same or a
+  higher level: ticking *3. Results* covers *3.1* and *3.2*; ticking *3.1* alone stops
+  at *3.2*.
+- **The scope is applied after table and figure resolution**, on the final logical
+  units (BODY / HEADING / CAPTION / FOOTNOTE / TABLE_CELL / FIGURE elements), never on
+  raw text items or pre-table / pre-figure blocks. Cell and figure grouping, the
+  numeric-only skip and source-item ownership are therefore identical to the
+  whole-document run; a partial scope adds an assertion that no source text item is
+  owned by two selected provider-bound units.
+- A unit that runs across the boundary (a paragraph merged across the page break, or
+  straddling a chapter anchor) is never cut: it is taken whole and counted as
+  *boundary-expanded* (Developer Mode). Nothing else of the neighbouring page comes
+  along.
+- **Only the selected units are sent**: terminology extraction samples the selected
+  units plus the title / abstract (same sample budget, still one request), translation
+  batches contain selected units only, and QA reviews selected translated units only
+  (same triggers, 5 % cap and critical bypass). The terminology cache is keyed by
+  document fingerprint + scope fingerprint; the translation cache key is unchanged
+  (target language + normalized text + relevant glossary hash), so a unit translated
+  for one scope is served from the cache when a later scope of the same PDF includes
+  it, and auto terms found for earlier scopes of the same PDF are kept so later
+  chapters use the same renderings.
+- **The exported file follows the scope** (`web/src/scope/output.ts`). 整份論文 always
+  writes the whole document. 自訂頁數 writes exactly the pages that were typed: a unit
+  that was expanded across the boundary is still translated, but it never adds an
+  output page. 選擇章節 writes every page the chapter touches, each page whole, so a
+  chapter that starts or ends in the middle of a page keeps that page complete.
+  A partial scope offers **保留完整 PDF（未選取部分維持英文）**, unticked by default; with
+  it the whole document is written and only this run's units carry the Chinese overlay.
+  Cutting the output changes nothing about what is sent to the provider, so it costs no
+  extra call and no extra token.
+- **The file name carries the range**: `paper_bilingual_zh-TW_p17.pdf`,
+  `paper_bilingual_zh-TW_p17-20.pdf`, `paper_bilingual_zh-TW_Methods_p5-8.pdf`. User
+  Mode shows the same range under the download button (`輸出頁面：第 5–8 頁`).
+- **One download = one scope.** The overlay is always the units of the run that just
+  finished; an earlier scope's translations stay in the cache (translating them again
+  costs no API call) but are never silently added to the file. Translating another
+  scope of the same PDF reuses the analysis, the chapter map and the translation cache;
+  the file is never read or analysed again. The whole PDF stays in the browser.
+- Developer Mode shows a **Translation Scope** panel (mode, chapter source, detected /
+  selected chapters, selected page range, selected / total logical units by type,
+  provider-bound units, boundary-expanded units, numeric-only cells skipped inside the
+  scope, duplicate selected source items, scope fingerprint) and the cost panel repeats
+  the scope of the run with its cache hits.
 
 ## Translation Behavior
 
@@ -366,6 +442,139 @@ writes before / after / debug PDFs and `metrics.json` for both tables and
 figures. The debug PDF outlines table cells in orange and figure elements in
 purple.
 
+### Sub / superscript reconstruction (`web/src/pdf/textruns.ts`, `superscript.ts`, `inline.ts`)
+
+Citation markers, exponents and indices (`caregivers.62`, `np2`, `H2O`, `FEV1`)
+are part of the text layer, not of the layout, and `getTextContent()` merges
+most of them into their neighbouring run. `textruns.ts` therefore replays the
+page's operator list (`getOperatorList()`), rebuilds every text run with its
+own matrix, and splits a merged text item back into its runs when the runs
+reproduce that item's characters exactly. When they do not, the original item
+is kept unchanged, so the split can neither lose nor duplicate a character.
+
+A run that is set smaller than its line and sits above its baseline is a
+**superscript**; smaller and below the baseline is a **subscript**. Each one is
+carried as a `ScriptRun { text, anchor }`, where `anchor` is the identifier it
+directly followed in the source (`np` for the exponent of `np2`, `n` for its
+lowered `p`, `H` for the `2` of `H2O`, `FEV` for the `1` of `FEV1`); spaces and
+punctuation are never part of an anchor. In the translation the renderer looks
+for anchor + run together, which is what keeps the exponent of `np2` off the
+`2` of an `F2,32` earlier in the same sentence. Raised and lowered runs share
+one "already taken" list, so no character is claimed twice, and a script run is
+drawn at `superscript.scale` of the line size with a positive or negative text
+rise (`Ts`) that leaves the line height untouched.
+
+Nothing in this path is tied to a particular string, formula or paper. Its
+three deliberate limits are:
+
+- **No anchor, no reconstruction.** A lowered run whose anchor cannot be found
+  in the translation is left on the baseline rather than placed by guess. (A
+  raised *citation* marker is the one exception: it may also be placed by its
+  number alone, the behaviour that predates anchors.)
+- **No invented scripts.** Only what the source itself typeset as a raised or
+  lowered run is reconstructed. Journals are not consistent — the same paper
+  may set `np2` with a lowered `p` in one line and as plain text in the next,
+  and `F1,16` may be plain text throughout — and the output mirrors the source
+  line by line instead of normalising it.
+- **Fail-safe when the identifier is translated away.** Models often render
+  `O2` / `CO2` as 氧 / 二氧化碳; the anchor then no longer exists, and the
+  reconstruction is abandoned for that run rather than applied to some other
+  digit. Losing the raised look is the accepted cost of never moving the wrong
+  character.
+
+### Generic layout roles (`web/src/pdf/roles.ts`, `web/src/pdf/detectors/`)
+
+Beyond tables and figures, two page patterns used to be flattened into plain
+BODY text: **structured abstracts** (short labels such as *Objective /
+Findings / Interpretation*, each followed by a paragraph) and **sidebars /
+callout boxes** (a shaded or outlined panel with its own heading, labels and
+body, "Key Points", "Highlights", "Research in Context"). Both are now
+detected generically and rendered with their hierarchy. No journal, publisher,
+page number or fixed sentence is ever checked; a list of common academic label
+words in `roles.ts` only adds a small confidence bonus.
+
+Every block carries a `role` next to its `type`:
+
+```text
+BODY  HEADING  STRUCTURED_LABEL  SIDEBAR  CALLOUT_BOX
+SIDEBAR_HEADING  SIDEBAR_LABEL  SIDEBAR_BODY  CAPTION  TABLE  FIGURE  FOOTNOTE  REFERENCE
+```
+
+Roles are assigned by a registry of detectors that run in ownership priority
+on the final block set (tables and figures already resolved):
+
+```text
+TABLE → FIGURE → SIDEBAR / CALLOUT → STRUCTURED ABSTRACT → CAPTION → BODY
+```
+
+Each detector answers with role assignments, containers and structured
+regions; the registry keeps an ownership ledger so no source text item is ever
+claimed twice (`duplicateSourceItems` stays 0 and the scope check still
+holds). A new pattern (pull quote, warning box, methods summary, clinical
+pearls, graphical-abstract label, supplementary sidebar) is one detector
+appended to `LAYOUT_DETECTORS` in `detectors/registry.ts`.
+
+- **Structured label** (`detectors/labels.ts`, `detectors/structuredAbstract.ts`):
+  a run-in label is the leading items of a paragraph's first line set in a
+  font the rest of the line does not use; a standalone label is a short bold
+  / capitalised / colon-ended block followed by a paragraph. Confidence comes
+  from typography and geometry (font change, weight, capitalisation, length,
+  what follows, a short rule above, size against the body) with the hint
+  words adding at most 0.15. Consecutive labels of one style, aligned on one
+  left edge with only body text between them, form a region; a region needs
+  at least two sections and confidence ≥ 0.6 (labels ≥ 0.5). A run-in label
+  is split into its own block (`<id>-L`, `labelFor`) and the paragraph keeps
+  the rest (`labelBlockId`); anything weaker stays ordinary BODY.
+- **Sidebar / callout** (`detectors/sidebar.ts`): candidate panels are the
+  page's filled rectangles and stroked frames (or rule-boxed rectangles) that
+  are large enough and not the page tint. Signals: fill, border, width
+  against the text column, text density, a heading-like first child, label +
+  body pairs; penalties: captions inside, numeric cells, row-shading
+  patterns, straddling blocks, table / figure text inside, two-column text.
+  Confidence ≥ 0.6 gives a `LayoutContainer` (SIDEBAR when narrower than
+  0.65 × the text column, CALLOUT_BOX otherwise) with its fill, border,
+  padding, inner roles (first short bold child → SIDEBAR_HEADING, run-in or
+  standalone labels → SIDEBAR_LABEL, the rest → SIDEBAR_BODY) and children
+  ids; a single coloured word or a one-line highlight never becomes one.
+- **Rendering** (`render.ts`, `typography.ts`): masks are painted in
+  `getBackgroundForBlock()` order — the enclosing container's fill (or a
+  header band inside it), else the smallest fill covering the glyphs, else
+  the page background, else white — each mask stays the glyph box plus a
+  minimal padding, is kept off every rule and never leaves its container, so
+  borders, rules and icons survive and the container is never redrawn. A dark
+  fill keeps its colour and switches the text to white. A run-in label is set
+  bold at ≥ body size on the paragraph's first baseline and the paragraph's
+  first line is indented past it (`structuredLabelAfter`); a label wider than
+  half the paragraph goes on a line of its own. Labels and sidebar headings
+  keep at least two of three contrasts to the body (size, weight, spacing;
+  `minimumHeadingBodyContrast`) and the fitting floor never pulls them below
+  the body size. Sidebar roles are sized against the container's own body
+  font. Spacing lives in `TYPOGRAPHY.spacing` (`structuredLabelBefore`,
+  `structuredLabelAfter`, `structuredSectionGap`).
+- **Translation**: a label and its paragraph are separate units (never merged
+  across a container or a role boundary); the Worker receives the role as the
+  unit `type` (`STRUCTURED_LABEL`, `SIDEBAR_HEADING`, `SIDEBAR_LABEL`,
+  `SIDEBAR_BODY`) with one short guidance line each. Terminology, QA, cache
+  and the translation scope are unchanged: a sidebar on an unselected page is
+  neither translated nor masked.
+- **Developer Mode** shows 版面角色診斷 (regions, labels, confidence, sections;
+  containers with bbox, background, border, padding, children and inner
+  roles; claimed / duplicate source items; what the export did) and the debug
+  PDF outlines containers in teal and structured regions / labels in magenta
+  (`Debug PDF 中標示版面角色`).
+
+Benchmark harness (no API calls): `LAYOUT_ROLES_BENCH_PDF=<file>
+LAYOUT_ROLES_BENCH_OUT=<dir> LAYOUT_ROLES_BENCH_PAGES=1 npx vitest run
+src/pdf/__tests__/layout-roles.bench.test.ts` writes `roles-before.pdf`
+(detectors off), `roles-after.pdf`, `roles-after-debug.pdf` and
+`roles-metrics.json` (labels, containers, overlap, overflow, white patches,
+container masks, duplicate source items). On the JAMA abstract page used as a
+regression fixture: 6 structured labels, 1 sidebar with 8 children (1
+heading, 3 labels, 4 body), 22 white-patch lines → 0, 25 container masks,
+duplicate source items 0, no new overlap or overflow (the remaining overflows
+come from the fake translations of short headings and are identical before
+and after).
+
 ## Translation Cost Optimizations
 
 The frontend minimizes unnecessary API usage by:
@@ -380,6 +589,43 @@ The frontend minimizes unnecessary API usage by:
 - Sending the block type only for non-body blocks (TITLE / HEADING / CAPTION / FOOTNOTE / TABLE)
 - Reviewing only hard-risk blocks in the QA pass (deterministic mismatches, negation / uncertainty next to numbers or outcomes), capped at 5 % of the translated blocks except for critical mismatches
 - Keeping PDF generation completely separate from translation calls
+
+## Token Usage Summary (per job)
+
+One **job** = one translation run of one PDF: the file was picked and 開始翻譯 (User
+Mode) or *Translate Full PDF* (Developer Mode) started a scope run. Its counters start
+at zero (`startJob()` in `web/src/main.ts`) and every provider call that run makes
+adds to them: terminology extraction, all translation batches, the client's retries,
+the Worker's own missing-id retry and the QA pass. Translating chapter A and then
+chapter B of the same PDF therefore reports each run on its own; a Developer Mode test
+run adds to the counters until the next full run.
+
+Only the **actual usage reported by the provider** is counted; nothing is estimated
+into the summary. The OpenAI provider reads `usage.input_tokens`,
+`usage.input_tokens_details.cached_tokens`, `usage.output_tokens` and
+`usage.output_tokens_details.reasoning_tokens`; the Anthropic provider reads
+`input_tokens` plus both cache counters and `output_tokens` (Claude bills thinking
+inside `output_tokens` and does not break it out, so its reasoning count stays 0).
+
+Per stage (terminology / translation / QA): input, cached input, output and reasoning
+tokens. The job totals are `totalInputTokens`, `totalCachedInputTokens`,
+`totalOutputTokens`, `totalReasoningTokens` and
+
+```text
+totalProcessedTokens = totalInputTokens + totalOutputTokens
+```
+
+`cachedInputTokens` is a subset of `inputTokens` and `reasoningTokens` a subset of
+`outputTokens`, so neither is ever added on top of the totals.
+
+- **User Mode** shows two lines under 翻譯完成: `本次 Token 使用量：XX,XXX`
+  (= `totalProcessedTokens`) and `翻譯時間：XX 秒` (terminology + translation + QA time).
+  The lines are hidden when no provider usage was reported, rather than showing an estimate.
+- **Developer Mode** shows the full per-stage breakdown and the job totals at the end of
+  the cost panel, and `window.__jobUsage` holds the same snapshot.
+
+The accounting lives in `web/src/translate/usage.ts` (`JobUsage`), covered by
+`web/src/translate/__tests__/usage.test.ts`.
 
 ## Authentication
 
@@ -615,6 +861,9 @@ Expected: `{"ok":true}`, `{"error":"UNAUTHORIZED"}`, then `401 401 401 401 401 4
 
 ## Known Limitations
 
+- Chapter detection depends on the PDF: without an outline it relies on the heuristic HEADING classification, so a paper whose headings are not recognised offers no chapter mode (whole document and page range still work); several bookmarks that share one destination produce empty chapters unless a heading with the same title is found
+- In chapter mode a partly ticked parent selects only its ticked children: the parent's own preamble (text between the parent heading and its first sub-heading) is included only when the parent itself is ticked
+- Cross-scope reuse of the translation cache is exact only when a unit's relevant glossary entries are unchanged: a later scope whose terminology extraction adds a term that occurs in an already translated unit re-translates that unit (the cache key includes the relevant glossary hash by design)
 - No OCR for scanned PDFs
 - Rotated pages / rotated text are not fully supported
 - Three-column layouts are not fully supported
@@ -626,9 +875,13 @@ Expected: `{"ok":true}`, `{"error":"UNAUTHORIZED"}`, then `401 401 401 401 401 4
 - Numeric and citation checks are heuristic: a value the translator legitimately rewrites (e.g. "12 percent" → "百分之十二" in words) is reported as a warning and reviewed, and a wrong value that keeps the same digits (e.g. a swapped pair of identical numbers) is not detected
 - Only hard-risk blocks are reviewed and the QA share is capped at 5 % of the blocks (critical mismatches excepted), so a paper with many negated or hedged findings leaves some hard-risk blocks unreviewed (listed as "skipped" in Developer Mode); soft-risk blocks (merged, cross-page, cut off, hedged or long without a trigger) are never reviewed
 - Figure / table references are kept in English ("Figure 2"), never rendered as 圖 2
+- Layout roles are heuristic and conservative: a run-in label is only recognised when the label and the text after it are separate text items in different fonts (a label set in the same font as its paragraph, or fused into one text item, stays BODY); a structured abstract needs at least two aligned sections of one label style; a sidebar needs a fill, frame or boxing rules (a panel drawn only as a raster image, or a gradient panel, is not detected); italic run-in labels are rendered with the synthetic bold
 - Access control uses one shared invite code, not individual accounts
 - Rate limits are per invite-code session and per source IP, not per person; users behind one shared IP share the 5-attempts-per-minute invite limit
 - Original English may remain searchable under white overlay masks in the generated PDF
+- Sub / superscript reconstruction is anchored to the identifier a run follows, so it is abandoned (run drawn on the baseline) whenever that identifier does not survive translation, e.g. `O2` rendered as 氧
+- Sub / superscripts are never invented: a source that typesets `F1,16` or `np2` as plain text keeps plain text in the translation, including where the same paper typesets it as a script elsewhere
+- A subscript is recognised only as an index (letters / digits, at most 6 characters, no spaces) set below its line; a lowered word, or a run whose own text item was never split out, stays ordinary text
 
 ## Fonts
 

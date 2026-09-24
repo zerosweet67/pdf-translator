@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const providerTranslate = vi.fn(async (blocks: { id: string; text: string }[]) => ({
   blocks: blocks.map((b) => ({ id: b.id, translation: `譯:${b.text}` })),
   model: 'mock-model',
-  usage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 },
+  usage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0, reasoningTokens: 0 },
 }));
 const providerTerminology = vi.fn(async (_samples: string[]) => ({
   terms: [
@@ -16,7 +16,7 @@ const providerTerminology = vi.fn(async (_samples: string[]) => ({
     { source: 'inspiratory neural drive', target: '吸氣神經驅動', abbreviation: null },
   ],
   model: 'mock-model',
-  usage: { inputTokens: 300, outputTokens: 50, cachedInputTokens: 0 },
+  usage: { inputTokens: 300, outputTokens: 50, cachedInputTokens: 0, reasoningTokens: 0 },
 }));
 let qaVerdicts: Record<string, { ok: boolean; translation: string | null; issues: string[] }> = {};
 let qaDropOnce = new Set<string>();
@@ -25,7 +25,7 @@ const providerReview = vi.fn(async (blocks: { id: string }[]) => ({
     .filter((b) => !qaDropOnce.delete(b.id))
     .map((b) => ({ id: b.id, ...(qaVerdicts[b.id] ?? { ok: true, translation: null, issues: [] }) })),
   model: 'mock-model',
-  usage: { inputTokens: 40, outputTokens: 8, cachedInputTokens: 0 },
+  usage: { inputTokens: 40, outputTokens: 8, cachedInputTokens: 0, reasoningTokens: 0 },
 }));
 vi.mock('../providers', () => ({
   createProvider: () => ({
@@ -90,7 +90,7 @@ describe('POST /terminology', () => {
       { source: 'chronic obstructive pulmonary disease', target: '慢性阻塞性肺病', abbreviation: 'COPD' },
       { source: 'inspiratory neural drive', target: '吸氣神經驅動', abbreviation: null },
     ]);
-    expect(body.usage).toEqual({ inputTokens: 300, outputTokens: 50, cachedInputTokens: 0 });
+    expect(body.usage).toEqual({ inputTokens: 300, outputTokens: 50, cachedInputTokens: 0, reasoningTokens: 0 });
     expect(body.provider).toBe('mock');
     expect(providerTerminology).toHaveBeenCalledWith(['Chronic obstructive pulmonary disease (COPD) is common.']);
   });

@@ -4,6 +4,10 @@
  *  - A BODY block whose text does not end a sentence is merged with the next
  *    BODY block in reading order (across the column gutter or the page break),
  *    up to MAX_MERGED_BLOCKS blocks.
+ *  - A block that pdf/paragraph.ts marked as an orphan sentence tail
+ *    (`orphanOf`) is never a unit of its own: it is appended to the unit of
+ *    the paragraph it belongs to, so the renderer flows one translation
+ *    through both boxes instead of translating and placing the tail alone.
  *  - Merging never crosses a heading, caption, title, reference entry or any
  *    non-translatable block other than running headers/footers.
  *  - Whatever is still incomplete after merging is flagged incompleteSource so
@@ -16,6 +20,7 @@
  * Pure function over TextBlock[], unit-tested in __tests__/merge.test.ts.
  */
 
+import { roleOf } from './roles';
 import { analyzeCompleteness, headContext, joinFragments, tailContext, type CompletenessResult } from './text';
 import type { BlockType, TextBlock, TranslationBlock } from './types';
 
@@ -27,8 +32,17 @@ export const LEGACY_CONTEXT_CHARS = 300;
 /** Font size difference (relative) still considered "the same paragraph style". */
 const FONT_SIZE_TOLERANCE = 0.1;
 
-/** Block types that may be merged with the following block of the same type. */
-const MERGEABLE: ReadonlySet<BlockType> = new Set(['BODY']);
+/**
+ * Block types that may be merged with the following block of the same type.
+ *
+ * A title or a heading is in here for one case only: its first line runs the
+ * full width of the page and its last line stops short, so the column model
+ * files them as SPANNING and LEFT and grouping — which runs per region —
+ * cannot put them in one block. findContinuation() then still needs a strong
+ * signal (the first part ends on a function word, a comma or a dash), which
+ * two headings that merely follow each other never give.
+ */
+const MERGEABLE: ReadonlySet<BlockType> = new Set(['BODY', 'TITLE', 'HEADING']);
 /** Blocks that sit between paragraphs without interrupting them. */
 const PASS_THROUGH: ReadonlySet<BlockType> = new Set(['HEADER', 'FOOTER']);
 
@@ -51,8 +65,11 @@ function findContinuation(
   for (let j = fromIndex + 1; j < blocks.length; j++) {
     const n = blocks[j];
     if (PASS_THROUGH.has(n.type)) continue;
+    if (n.orphanOf) continue; // a tail already owned by an earlier paragraph
 
     if (!n.translate || n.type !== last.type) return null; // heading, caption, reference, table fragment...
+    // A sidebar paragraph never continues into the main text (or the other way round).
+    if (roleOf(n) !== roleOf(last) || n.containerId !== last.containerId) return null;
     if (n.page !== last.page && n.page !== last.page + 1) return null;
     if (Math.abs(n.fontSize - last.fontSize) > FONT_SIZE_TOLERANCE * last.fontSize) return null;
 
@@ -71,28 +88,74 @@ function findContinuation(
   return null;
 }
 
+/**
+ * Orphan tails (pdf/paragraph.ts) indexed by the paragraph that owns them.
+ * A tail whose owner is missing or untranslatable keeps its independence, so
+ * no text can be lost by an incomplete plan.
+ */
+function orphansByOwner(blocks: readonly TextBlock[]): Map<string, TextBlock[]> {
+  const byId = new Map(blocks.map((b) => [b.id, b]));
+  const map = new Map<string, TextBlock[]>();
+  for (const b of blocks) {
+    if (!b.orphanOf) continue;
+    const owner = byId.get(b.orphanOf);
+    if (!owner || !owner.translate) continue;
+    const list = map.get(b.orphanOf) ?? [];
+    list.push(b);
+    map.set(b.orphanOf, list);
+  }
+  return map;
+}
+
 export function buildTranslationBlocks(blocks: TextBlock[]): TranslationBlock[] {
   const out: TranslationBlock[] = [];
   const consumed = new Set<string>();
+  const orphans = orphansByOwner(blocks);
+  const absorbed = new Set<string>();
+  for (const list of orphans.values()) for (const o of list) consumed.add(o.id);
 
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
+    // `consumed` already holds every tail that a paragraph claimed; a tail
+    // whose owner cannot produce a unit is left to emit its own, as before.
     if (!b.translate || consumed.has(b.id)) continue;
 
-    const group: TextBlock[] = [b];
-    let text = b.text;
-    let completeness = analyzeCompleteness(text);
+    const group: TextBlock[] = [];
+    const orphanIds: string[] = [];
     const reasons: string[] = [];
+    let text = '';
+    /** Continuation merges only; absorbed tails do not use up the budget. */
+    let merges = 1;
+
+    const add = (block: TextBlock) => {
+      group.push(block);
+      text = text ? joinFragments(text, block.text) : block.text;
+    };
+    /** Give the paragraph back the sentence tails that were split off it. */
+    const absorb = (owner: TextBlock) => {
+      for (const tail of orphans.get(owner.id) ?? []) {
+        if (absorbed.has(tail.id)) continue;
+        absorbed.add(tail.id);
+        add(tail);
+        orphanIds.push(tail.id);
+        reasons.push(`${owner.id}→${tail.id} (orphan-tail: ${tail.orphanReason ?? 'sentence tail'})`);
+      }
+    };
+
+    add(b);
+    absorb(b);
+    let completeness = analyzeCompleteness(text);
 
     if (MERGEABLE.has(b.type)) {
       let cursor = i;
-      while (!completeness.complete && group.length < MAX_MERGED_BLOCKS) {
+      while (!completeness.complete && merges < MAX_MERGED_BLOCKS) {
         const found = findContinuation(blocks, cursor, group[group.length - 1], completeness);
         if (!found) break;
-        group.push(found.block);
+        merges++;
         consumed.add(found.block.id);
-        text = joinFragments(text, found.block.text);
+        add(found.block);
         reasons.push(found.why);
+        absorb(found.block);
         cursor = found.index;
         completeness = analyzeCompleteness(text);
       }
@@ -100,6 +163,9 @@ export function buildTranslationBlocks(blocks: TextBlock[]): TranslationBlock[] 
 
     const sourceBlockIds = group.map((g) => g.id);
     const wasMerged = group.length > 1;
+    const last = group[group.length - 1];
+    const superscripts = group.flatMap((g) => g.superscripts ?? []);
+    const subscripts = group.flatMap((g) => g.subscripts ?? []);
     out.push({
       id: wasMerged ? `merged-${sourceBlockIds.join('-')}` : b.id,
       page: b.page,
@@ -107,16 +173,55 @@ export function buildTranslationBlocks(blocks: TextBlock[]): TranslationBlock[] 
       type: b.type,
       sectionType: b.sectionType,
       blockType: b.blockType,
+      role: roleOf(b),
+      containerId: b.containerId,
       text,
       sourceBlockIds,
       wasMerged,
       mergeReason: wasMerged ? reasons.join('; ') : null,
+      orphanFragmentIds: orphanIds.length ? orphanIds : undefined,
+      superscripts: superscripts.length ? [...superscripts] : undefined,
+      subscripts: subscripts.length ? [...subscripts] : undefined,
       incompleteSource: !completeness.complete,
       previousContext: null,
       nextContext: null,
       contextReason: null,
+      span: { startPage: b.page, startY: b.top, endPage: last.page, endY: last.y },
     });
   }
+
+  // A tail whose owner never produced a unit stays a unit of its own: better
+  // an isolated fragment than text that silently disappears from the page.
+  let stranded = 0;
+  for (const list of orphans.values()) {
+    for (const tail of list) {
+      if (absorbed.has(tail.id)) continue;
+      stranded++;
+      out.push({
+        id: tail.id,
+        page: tail.page,
+        pages: [tail.page],
+        type: tail.type,
+        sectionType: tail.sectionType,
+        blockType: tail.blockType,
+        role: roleOf(tail),
+        containerId: tail.containerId,
+        text: tail.text,
+        sourceBlockIds: [tail.id],
+        wasMerged: false,
+        mergeReason: null,
+        superscripts: tail.superscripts?.length ? [...tail.superscripts] : undefined,
+        subscripts: tail.subscripts?.length ? [...tail.subscripts] : undefined,
+        incompleteSource: !analyzeCompleteness(tail.text).complete,
+        previousContext: null,
+        nextContext: null,
+        contextReason: null,
+        span: { startPage: tail.page, startY: tail.top, endPage: tail.page, endY: tail.y },
+      });
+    }
+  }
+  // Stable sort: only the stranded tails appended above move into place.
+  if (stranded > 0) out.sort((a, b2) => a.page - b2.page);
 
   assignContext(out);
   return out;

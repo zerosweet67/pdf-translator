@@ -27,30 +27,53 @@ import {
   rgb,
   setFillingRgbColor,
   setFontAndSize,
+  setLineWidth,
+  setStrokingRgbColor,
   setTextMatrix,
+  setTextRenderingMode,
+  setTextRise,
   showText,
   StandardFonts,
+  TextRenderingMode,
   type PDFEmbeddedPage,
   type PDFFont,
   type PDFName,
+  type PDFOperator,
   type PDFPage,
 } from 'pdf-lib';
-import { fitTextToBoxes, type BoxSpec, MAX_EXTENSION_RATIO } from './fit';
+import { fitTextToBoxes, measureSegments, type BoxSpec, MAX_EXTENSION_RATIO } from './fit';
 import { embedFontSet, FontLoadError, MixedFont, sanitizeForFont, type FontSetBytes, type TextRun } from './font';
+import { buildInlineSegments } from './inline';
 import { GLYPH_ASCENT, GLYPH_DESCENT } from './layout';
+import { roleOf } from './roles';
+import { trailingMarker } from './superscript';
+import {
+  hasRequiredContrast,
+  LABEL_TYPOGRAPHY_ROLES,
+  subscriptRise,
+  superscriptRise,
+  superscriptSize,
+  TYPOGRAPHY,
+  typographyFor,
+  type TypographySpec,
+} from './typography';
 import {
   clipMaskOffRules,
   clipMaskToRules,
   fitTextToTableCell,
   placeTableCellLines,
   tableCellMaskRects,
+  textColorFor,
   type CellPlacement,
   type TableFitResult,
 } from './table';
 import type {
   BlockType,
   ImageBox,
+  InlineSegment,
+  LayoutContainer,
   LayoutResult,
+  LayoutRole,
   PageDebugInfo,
   PdfAnalysis,
   Rect,
@@ -88,8 +111,18 @@ const BACKGROUND_IMAGE_RATIO = 0.9;
 const ROTATION_EPS = 0.02;
 /** Keep this distance from the page bottom when extending a block downward. */
 const PAGE_BOTTOM_MARGIN = 2;
+/** A heading never comes closer than this to the block under (or over) it. */
+const HEADING_CLEARANCE = 1;
+/** A centred line leaves at least this share of the text measure free on each side. */
+const CENTERED_MIN_SIDE = 0.05;
 /** Yield to the event loop after this many blocks so the UI can repaint. */
 const YIELD_EVERY_BLOCKS = 20;
+/** A fill covering at least this share of the page is the page background. */
+const PAGE_BACKGROUND_SHARE = 0.9;
+/** A run-in label may take at most this share of its paragraph width; wider labels go on a line of their own. */
+const RUN_IN_LABEL_MAX_SHARE = 0.5;
+/** Slack (points) when testing whether a fill covers a block. */
+const COVER_SLACK = 0.75;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -133,12 +166,40 @@ export interface BlockRenderReport {
   sourceBlockIds: string[];
   page: number;
   type: BlockType;
+  /** Layout role of the unit (pdf/roles.ts). */
+  role: LayoutRole;
+  /** Mask background used for this unit: the colour and where it came from. */
+  background?: { color: string | null; source: BackgroundSource; light: boolean };
+  /** Vertical extent of the drawn text of the first source box (paragraph path): top of the first line to the last descender. */
+  extent?: { top: number; bottom: number };
   /** Present for logical table cells. */
   cell?: CellReport;
   /** Original font size of the first source block. */
   fontSize: number;
   finalFontSize: number | null;
   lines: number;
+  /** Paragraph typography that was applied (absent for table / figure cells). */
+  typography?: {
+    role: TypographySpec['role'];
+    /** Size the fitting started from (may be above the source size). */
+    startFontSize: number;
+    /** Floor the fitting was not allowed to go below. */
+    minFontSize: number;
+    /** finalFontSize / document body font size. */
+    bodyRatio: number;
+    bold: boolean;
+    firstLineIndent: number;
+    spaceBefore: number;
+    spaceAfter: number;
+    /** Raised citation markers drawn in this unit. */
+    superscripts: number;
+    /** Lowered runs drawn in this unit. */
+    subscripts?: number;
+    /** Label / sidebar heading: which contrasts to the body text hold (size / weight / spacing). */
+    contrast?: string[];
+    /** Run-in label drawn on the first line of its paragraph ("inline") or on a line of its own. */
+    labelPlacement?: 'inline' | 'own-line';
+  };
   /** True when the layout is not reliable (overflow, page clipping, draw failure). */
   warning: boolean;
   /** Warning or skip reason, null when everything went fine. */
@@ -148,6 +209,66 @@ export interface BlockRenderReport {
   skipped: boolean;
   /** Characters drawn with the fallback font because the primary font lacks the glyph. */
   fallbackGlyphs: number;
+}
+
+/**
+ * Developer Mode typography diagnostics: what the new paragraph / heading /
+ * citation rules actually did on this export.
+ */
+export interface TypographyStats {
+  /** Units drawn with the TITLE typography. */
+  titles: number;
+  /** Units drawn with the HEADING typography. */
+  headings: number;
+  /** Headings / titles whose start size was raised above the source size. */
+  sizeBoosted: number;
+  /** Headings / titles drawn with the synthetic bold. */
+  boldDrawn: number;
+  /** Headings / titles that hit their size floor (would have shrunk to body size). */
+  floorApplied: number;
+  /** Headings fitted against the free space under them instead of their own box alone. */
+  headingsSpaceBound: number;
+  /** Headings whose ink still reaches the block below after every downgrade. */
+  headingCollisions: number;
+  /** Smallest heading-to-body size ratio actually drawn (0 when none). */
+  minHeadingBodyRatio: number;
+  /** Paragraphs drawn with a first-line indent. */
+  indentedParagraphs: number;
+  /** Units that reserved paragraph spacing before / after. */
+  spacedParagraphs: number;
+  /** Citation markers drawn raised. */
+  superscriptRuns: number;
+  /** Units that carry at least one raised marker. */
+  superscriptUnits: number;
+  /** Runs drawn lowered (subscripts recovered from the text layer). */
+  subscriptRuns: number;
+  /** Units that carry at least one lowered run. */
+  subscriptUnits: number;
+  /** Trailing markers the model dropped and that were put back. */
+  superscriptRestored: number;
+}
+
+/**
+ * Developer Mode layout-role diagnostics: what the generic roles did on this
+ * export (pdf/roles.ts, pdf/detectors/).
+ */
+export interface LayoutRoleStats {
+  structuredLabels: number;
+  sidebarHeadings: number;
+  sidebarLabels: number;
+  sidebarBodies: number;
+  /** Run-in labels drawn on the first line of their paragraph. */
+  inlineLabels: number;
+  /** Labels that did not fit beside their paragraph and were set on a line of their own. */
+  ownLineLabels: number;
+  /** Labels / sidebar headings that hold fewer contrasts than required. */
+  contrastShortfall: number;
+  /** Masks painted in a container's fill instead of white. */
+  containerMasks: number;
+  /** Masks painted in a covering fill colour (outside containers). */
+  tintedMasks: number;
+  /** Units drawn in white on a dark background. */
+  lightTextUnits: number;
 }
 
 export interface RenderStats {
@@ -168,6 +289,10 @@ export interface RenderStats {
   figureCells: number;
   figureCellsWritten: number;
   figureCellsOverflow: number;
+  /** Heading hierarchy, paragraph spacing and citation reconstruction. */
+  typography: TypographyStats;
+  /** Structured labels, sidebar roles and background-aware masks. */
+  layoutRoles: LayoutRoleStats;
 }
 
 export interface RenderResult {
@@ -203,6 +328,8 @@ export interface RenderOptions {
   unitIds?: ReadonlySet<string> | null;
   /** Required in overlay mode: the loaded font files (see font.ts loadFontSet). */
   fonts?: FontSetBytes | null;
+  /** Debug mode: also draw sidebar containers, structured regions and role boxes (default true). */
+  debugRoles?: boolean;
   onProgress?: (progress: RenderProgress) => void;
 }
 
@@ -330,7 +457,7 @@ function lineExtent(line: TextLine): { top: number; bottom: number } {
 }
 
 /** Multi-line blocks whose lines all share the block's centre are centred (titles, some headings). */
-function isCenteredBlock(block: TextBlock, page: PageDebugInfo): boolean {
+export function isCenteredBlock(block: TextBlock, page: PageDebugInfo, blocks: readonly TextBlock[] = []): boolean {
   if (block.type !== 'TITLE' && block.type !== 'HEADING') return false;
   const center = block.x + block.width / 2;
   if (block.lines.length >= 2) {
@@ -339,19 +466,165 @@ function isCenteredBlock(block: TextBlock, page: PageDebugInfo): boolean {
     const notFlushLeft = block.lines.some((l) => l.x - block.x > 2);
     return allCentered && notFlushLeft;
   }
-  // Single line: centred on the page (single-column or spanning) is the only reliable signal.
+  // Single line: centred on the page (single-column or spanning) is the only
+  // reliable signal — but a line that fills the text measure has its centre on
+  // the page centre by construction and is flush left, not centred. So it also
+  // has to leave a real margin on both sides of what the page writes in.
   if (block.column === 'FULL' || block.column === 'SPANNING') {
     const [x0, , x1] = page.view;
     const pageCenter = (x0 + x1) / 2;
-    return Math.abs(center - pageCenter) <= 3 && block.x - x0 > 30;
+    if (Math.abs(center - pageCenter) > 3 || block.x - x0 <= 30) return false;
+    const measure = textMeasure(blocks);
+    if (!measure) return true;
+    const side = Math.min(block.x - measure.left, measure.right - (block.x + block.width));
+    return side >= CENTERED_MIN_SIDE * (measure.right - measure.left);
   }
   return false;
+}
+
+/** Left and right edge of what the page writes in, ignoring the running furniture. */
+function textMeasure(blocks: readonly TextBlock[]): { left: number; right: number } | null {
+  let left = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  for (const b of blocks) {
+    if (b.type === 'HEADER' || b.type === 'FOOTER' || b.width <= 0) continue;
+    left = Math.min(left, b.x);
+    right = Math.max(right, b.x + b.width);
+  }
+  return right > left ? { left, right } : null;
 }
 
 /** Extension allowed below a block: 25 % of its height, but never past the page bottom. */
 function extensionFor(block: TextBlock, page: PageDebugInfo): number {
   const pageBottom = page.view[1] + PAGE_BOTTOM_MARGIN;
   return Math.max(0, Math.min(MAX_EXTENSION_RATIO * block.height, block.y - pageBottom));
+}
+
+/** Empty space a block has around it, before the next block starts. */
+export interface BlockSpace {
+  above: number;
+  below: number;
+  /** Free width to the right of the box, up to the right edge of its own column. */
+  right: number;
+}
+
+/** Two blocks share a column band when their horizontal ranges overlap. */
+function sameColumnBand(a: TextBlock, b: TextBlock): boolean {
+  return a.x < b.x + b.width && b.x < a.x + a.width;
+}
+
+/**
+ * How much empty page a block has over and under it.
+ *
+ * "Under" is the room a heading may take: from the bottom of its box to the
+ * top of the next block whose horizontal range it overlaps, or the page
+ * margin when there is none. The two columns of a page never constrain each
+ * other, because their ranges do not overlap.
+ */
+export function spaceAround(block: TextBlock, blocks: readonly TextBlock[], page: PageDebugInfo): BlockSpace {
+  let above = page.view[3] - block.top;
+  let below = block.y - (page.view[1] + PAGE_BOTTOM_MARGIN);
+  const centre = block.y + block.height / 2;
+  const right = block.x + block.width;
+  let columnRight = right;
+  let blocked = Number.POSITIVE_INFINITY;
+  for (const other of blocks) {
+    if (other === block || other.page !== block.page) continue;
+    if (sameColumnBand(block, other)) {
+      // Which side a neighbour is on is decided by its centre, so boxes that
+      // touch (or overlap by a fraction of a point) still count, with no room.
+      if (other.y + other.height / 2 > centre) above = Math.min(above, other.y - block.top);
+      else below = Math.min(below, block.y - other.top);
+      columnRight = Math.max(columnRight, other.x + other.width);
+    } else if (other.x >= right && other.y < block.top && other.top > block.y) {
+      blocked = Math.min(blocked, other.x); // stands beside this box, on its own lines
+    }
+  }
+  return {
+    above: Math.max(0, above),
+    below: Math.max(0, below),
+    right: Math.max(0, Math.min(columnRight, blocked) - right),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Background-aware masking
+// ---------------------------------------------------------------------------
+
+export type BackgroundSource = 'container' | 'fill' | 'page' | 'white';
+
+export interface BlockBackground {
+  /** Mask colour ("#f4f3ec"), null for white paper. */
+  color: string | null;
+  source: BackgroundSource;
+  /** True when the colour is dark enough that the text is drawn in white. */
+  light: boolean;
+  /** Masks never leave this rectangle (the container or the fill), null for the page. */
+  clip: Rect | null;
+  /** Container the block belongs to, when any. */
+  container: LayoutContainer | null;
+}
+
+function covers(fill: Rect, box: Rect, slack = COVER_SLACK): boolean {
+  return (
+    fill.x <= box.x + slack &&
+    fill.y <= box.y + slack &&
+    fill.x + fill.width >= box.x + box.width - slack &&
+    fill.y + fill.height >= box.y + box.height - slack
+  );
+}
+
+function rectArea(r: Rect): number {
+  return Math.max(0, r.width) * Math.max(0, r.height);
+}
+
+function normalizeColor(color: string | null): string | null {
+  return !color || color === '#ffffff' ? null : color;
+}
+
+/**
+ * The background a block's masks must be painted in, in this order:
+ *
+ *   1. the enclosing container: the smallest fill inside the container that
+ *      covers the glyphs (a header band), else the container's own fill;
+ *   2. the smallest filled rectangle that covers the glyph box;
+ *   3. the page background (a fill covering almost the whole page);
+ *   4. white.
+ *
+ * The colour is kept as it is; a dark background only switches the text to
+ * white (WCAG contrast, see table.ts), it never lightens the panel.
+ */
+export function getBackgroundForBlock(
+  block: TextBlock,
+  page: PageDebugInfo,
+  containers: ReadonlyMap<string, LayoutContainer>,
+): BlockBackground {
+  const box: Rect = { x: block.x, y: block.y, width: block.width, height: block.height };
+  const container = block.containerId ? (containers.get(block.containerId) ?? null) : null;
+  const covering = page.fills
+    .filter((f) => covers(f, box))
+    .sort((a, b) => rectArea(a) - rectArea(b));
+  const [x0, y0, x1, y1] = page.view;
+  const pageArea = Math.max(1, (x1 - x0) * (y1 - y0));
+
+  const finish = (color: string | null, source: BackgroundSource, clip: Rect | null): BlockBackground => ({
+    color,
+    source,
+    light: textColorFor(color) === 'light',
+    clip,
+    container,
+  });
+
+  if (container) {
+    const inside = covering.find((f) => covers(container.bbox, f, 1) && rectArea(f) < pageArea * PAGE_BACKGROUND_SHARE);
+    const color = inside ? normalizeColor(inside.color) : container.backgroundFill;
+    return finish(color, 'container', container.bbox);
+  }
+  const fill = covering.find((f) => rectArea(f) < pageArea * PAGE_BACKGROUND_SHARE && f.color !== null);
+  if (fill) return finish(normalizeColor(fill.color), 'fill', { x: fill.x, y: fill.y, width: fill.width, height: fill.height });
+  const pageFill = page.fills.find((f) => rectArea(f) >= pageArea * PAGE_BACKGROUND_SHARE && normalizeColor(f.color) !== null);
+  if (pageFill) return finish(normalizeColor(pageFill.color), 'page', null);
+  return finish(null, 'white', null);
 }
 
 // ---------------------------------------------------------------------------
@@ -446,11 +719,17 @@ function drawCellMasks(page: PDFPage, block: TextBlock, cell: TableCellInfo, pag
   return drawn;
 }
 
-function drawLineMask(page: PDFPage, line: TextLine, pageInfo: PageDebugInfo): boolean {
+/**
+ * Mask one source line: its glyph box plus a minimal padding, in the block's
+ * background colour, kept off any ruling line and never outside the
+ * container or fill it belongs to. Borders, rules, icons and markers next to
+ * the text are therefore never painted over.
+ */
+export function lineMaskRect(line: TextLine, pageInfo: PageDebugInfo, background: BlockBackground): Rect | null {
   const [x0, y0, x1, y1] = pageInfo.view;
   const { top, bottom } = lineExtent(line);
-  const left = clamp(line.x - MASK_PAD_X, x0, x1);
-  const right = clamp(line.x + line.width + MASK_PAD_X, x0, x1);
+  let left = clamp(line.x - MASK_PAD_X, x0, x1);
+  let right = clamp(line.x + line.width + MASK_PAD_X, x0, x1);
   let lo = clamp(bottom - MASK_PAD_Y, y0, y1);
   let hi = clamp(top + MASK_PAD_Y, y0, y1);
   if (pageInfo.rules.length > 0) {
@@ -458,9 +737,30 @@ function drawLineMask(page: PDFPage, line: TextLine, pageInfo: PageDebugInfo): b
     const clipped = clipMaskToRules({ x: left, y: lo, width: right - left, height: hi - lo }, line.y, line.fontSize, pageInfo.rules);
     lo = clipped.y;
     hi = clipped.y + clipped.height;
+    if (background.source !== 'white') {
+      // Inside a panel: the panel's own border and rules survive as well.
+      const off = clipMaskOffRules({ x: left, y: lo, width: right - left, height: hi - lo }, pageInfo.rules);
+      left = off.x;
+      right = off.x + off.width;
+      lo = off.y;
+      hi = off.y + off.height;
+    }
   }
-  if (right - left <= 0 || hi - lo <= 0) return false;
-  page.drawRectangle({ x: left, y: lo, width: right - left, height: hi - lo, color: WHITE, borderWidth: 0 });
+  if (background.clip) {
+    const c = background.clip;
+    left = Math.max(left, c.x);
+    right = Math.min(right, c.x + c.width);
+    lo = Math.max(lo, c.y);
+    hi = Math.min(hi, c.y + c.height);
+  }
+  if (right - left <= 0 || hi - lo <= 0) return null;
+  return { x: left, y: lo, width: right - left, height: hi - lo };
+}
+
+function drawLineMask(page: PDFPage, line: TextLine, pageInfo: PageDebugInfo, background: BlockBackground): boolean {
+  const r = lineMaskRect(line, pageInfo, background);
+  if (!r) return false;
+  page.drawRectangle({ x: r.x, y: r.y, width: r.width, height: r.height, color: hexColor(background.color), borderWidth: 0 });
   return true;
 }
 
@@ -497,36 +797,119 @@ class PageTextWriter {
     ops.push(endText());
     this.page.pushOperators(...ops);
   }
+
+  /**
+   * One wrapped line made of ordinary and raised runs.
+   *
+   *  - a script run — raised or lowered — is set at `superscriptSize(size)`
+   *    and shifted with the text rise operator (Ts), which moves the glyphs
+   *    without touching the line's own advance, so the paragraph's line height
+   *    is unaffected;
+   *  - `bold` is synthetic: no bold font file is shipped, so the glyphs are
+   *    filled AND stroked (Tr 2) with a hairline. Both the rise and the
+   *    rendering mode live in the graphics state, so the whole line is wrapped
+   *    in q / Q and nothing leaks into the next draw.
+   */
+  drawSegments(
+    segments: readonly InlineSegment[],
+    x: number,
+    y: number,
+    size: number,
+    mixed: MixedFont,
+    style: { bold?: boolean; boldStrokeRatio?: number; light?: boolean } = {},
+  ): void {
+    const bold = style.bold === true && (style.boldStrokeRatio ?? 0) > 0;
+    const level = style.light ? 1 : 0;
+    const ops: PDFOperator[] = [];
+    if (bold) {
+      ops.push(
+        pushGraphicsState(),
+        setStrokingRgbColor(level, level, level),
+        setLineWidth(size * (style.boldStrokeRatio ?? 0)),
+      );
+    }
+    ops.push(beginText(), setFillingRgbColor(level, level, level), setTextMatrix(1, 0, 0, 1, x, y));
+    if (bold) ops.push(setTextRenderingMode(TextRenderingMode.FillAndOutline));
+    const supSize = superscriptSize(size);
+    const supRise = superscriptRise(size);
+    const subDrop = subscriptRise(size);
+    let rise = 0;
+    for (const seg of segments) {
+      if (!seg.text) continue;
+      const script = seg.sup || seg.sub === true;
+      const wanted = seg.sup ? supRise : seg.sub ? subDrop : 0;
+      if (wanted !== rise) {
+        ops.push(setTextRise(wanted));
+        rise = wanted;
+      }
+      const runSize = script ? supSize : size;
+      for (const run of mixed.runs(seg.text)) {
+        ops.push(setFontAndSize(this.key(run.font), runSize), showText(run.font.encodeText(run.text)));
+      }
+    }
+    if (rise !== 0) ops.push(setTextRise(0));
+    ops.push(endText());
+    if (bold) ops.push(popGraphicsState());
+    this.page.pushOperators(...ops);
+  }
 }
 
+interface BlockTextStyle {
+  /** Points the first baseline is pushed down by (paragraph space before). */
+  topOffset: number;
+  /** Points the first line is indented by. */
+  firstLineIndent: number;
+  bold: boolean;
+  boldStrokeRatio: number;
+  /** White text (dark background). */
+  light?: boolean;
+  /** A run-in label shares the first baseline of its paragraph: draw at exactly this baseline. */
+  baselineOverride?: number;
+}
+
+/**
+ * Paragraph path: draw the wrapped lines of one source box.
+ *
+ * `topOffset` is the paragraph space above the block — for a heading it is a
+ * slide into the gap that precedes it, for body text it was already taken out
+ * of the box height, so in both cases the first baseline simply starts lower.
+ * `firstLineIndent` shifts the first line only; the wrapper already shortened
+ * that line by the same amount.
+ */
 function drawBlockText(
   writer: PageTextWriter,
   block: TextBlock,
   pageInfo: PageDebugInfo,
-  lines: readonly string[],
+  lines: readonly InlineSegment[][],
   fontSize: number,
   lineHeight: number,
   mixed: MixedFont,
   centered: boolean,
+  style: BlockTextStyle,
 ): DrawTextOutcome {
   const pageBottom = pageInfo.view[1];
-  let baseline = block.top - GLYPH_ASCENT * fontSize;
+  let baseline = style.baselineOverride ?? block.top - style.topOffset - GLYPH_ASCENT * fontSize;
   let drawn = 0;
   let clipped = 0;
-  for (const line of lines) {
+  for (const [index, segments] of lines.entries()) {
     if (baseline - GLYPH_DESCENT * fontSize < pageBottom) {
       clipped++;
       baseline -= lineHeight;
       continue;
     }
-    if (line.length > 0) {
-      let x = block.x;
+    if (segments.length > 0) {
+      const indent = index === 0 ? style.firstLineIndent : 0;
+      let x = block.x + indent;
       if (centered) {
-        const w = mixed.widthOfTextAtSize(line, fontSize);
+        const w = measureSegments(segments, mixed, fontSize);
         x = block.x + Math.max(0, (block.width - w) / 2);
       }
       try {
-        writer.drawRuns(mixed.runs(line), x, baseline, fontSize);
+        writer.drawSegments(segments, x, baseline, fontSize, mixed, {
+          bold: style.bold,
+          boldStrokeRatio: style.boldStrokeRatio,
+          light: style.light,
+        });
       } catch (err) {
         return { drawn, clipped, error: err instanceof Error ? err.message : String(err) };
       }
@@ -565,6 +948,67 @@ function drawDebugCell(page: PDFPage, block: TextBlock, cell: TableCellInfo, lab
     // labels are optional
   }
   void block;
+}
+
+/** Debug PDF colours of the generic layout roles. */
+const TEAL = rgb(0.0, 0.55, 0.55);
+const MAGENTA = rgb(0.8, 0.1, 0.6);
+const ROLE_COLORS: Partial<Record<LayoutRole, ReturnType<typeof rgb>>> = {
+  STRUCTURED_LABEL: MAGENTA,
+  SIDEBAR_HEADING: TEAL,
+  SIDEBAR_LABEL: rgb(0.0, 0.4, 0.75),
+  SIDEBAR_BODY: rgb(0.3, 0.65, 0.65),
+};
+
+/**
+ * Debug PDF, Developer Mode only: sidebar / callout containers (teal, inner
+ * area dashed), structured abstract regions (magenta dashed) with their
+ * sections (thin), and every block that carries a detector-assigned role in
+ * its role colour.
+ */
+function drawDebugRoles(page: PDFPage, pageInfo: PageDebugInfo, layout: LayoutResult, labelFont: PDFFont): void {
+  const rect = (r: Rect, color: ReturnType<typeof rgb>, width: number, dashed: boolean) =>
+    page.drawRectangle({
+      x: r.x,
+      y: r.y,
+      width: Math.max(0.1, r.width),
+      height: Math.max(0.1, r.height),
+      borderColor: color,
+      borderWidth: width,
+      borderDashArray: dashed ? [2, 2] : undefined,
+      color: undefined,
+    });
+  const label = (text: string, x: number, y: number, color: ReturnType<typeof rgb>) => {
+    try {
+      page.drawText(text.replace(/[^\x20-\x7e]/g, '?'), { x, y, size: 4, font: labelFont, color });
+    } catch {
+      // labels are optional
+    }
+  };
+  for (const c of layout.containers) {
+    if (c.page !== pageInfo.pageNumber) continue;
+    rect(c.bbox, TEAL, 1, false);
+    const inner: Rect = {
+      x: c.bbox.x + c.padding.left,
+      y: c.bbox.y + c.padding.bottom,
+      width: c.bbox.width - c.padding.left - c.padding.right,
+      height: c.bbox.height - c.padding.top - c.padding.bottom,
+    };
+    rect(inner, TEAL, 0.4, true);
+    label(`${c.id} ${c.type} ${c.confidence} bg=${c.backgroundFill ?? 'none'}`, c.bbox.x + 1, c.bbox.y + c.bbox.height + 1.5, TEAL);
+  }
+  for (const r of layout.structuredRegions) {
+    if (r.page !== pageInfo.pageNumber) continue;
+    rect(r.bbox, MAGENTA, 0.8, true);
+    label(`${r.id} structured abstract ${r.confidence}`, r.bbox.x + 1, r.bbox.y + r.bbox.height + 1.5, MAGENTA);
+    for (const s of r.sections) rect(s.bbox, MAGENTA, 0.3, true);
+  }
+  for (const b of layout.blocks) {
+    if (b.page !== pageInfo.pageNumber || !b.roleDetector) continue;
+    const color = ROLE_COLORS[roleOf(b)];
+    if (!color) continue;
+    rect({ x: b.x, y: b.y, width: b.width, height: b.height }, color, 0.6, false);
+  }
 }
 
 function drawDebugPage(
@@ -648,6 +1092,8 @@ interface UnitLayout {
   lineHeight: number;
   /** Lines per source block id. */
   parts: Map<string, string[]>;
+  /** The same lines as inline runs (raised citation markers), per source block id. */
+  segmentParts: Map<string, InlineSegment[][]>;
   fits: boolean;
   extended: boolean;
   overflow: number;
@@ -655,8 +1101,46 @@ interface UnitLayout {
   fallbackGlyphs: number;
   iterations: number;
   minFontSize: number;
+  /** Heading only: the fit was bound by the free space under the block. */
+  spaceBound?: boolean;
+  /** Heading only: the ink still reaches the block below (nothing left to give up). */
+  collision?: boolean;
+  /** Paragraph typography of this unit (absent for table / figure cells). */
+  spec?: TypographySpec;
+  /** Points the first box is pushed down by. */
+  topOffset?: number;
+  /** First-line indent actually used for the first box (a run-in label widens it). */
+  firstLineIndent?: number;
+  /** Raised citation markers in the drawn text. */
+  superscriptRuns?: number;
+  /** Subscript runs drawn lowered in this unit. */
+  subscriptRuns?: number;
+  /** True when a trailing marker the model dropped was put back. */
+  markerRestored?: boolean;
   /** Table cell: the table-only fit and where its lines go. */
   table?: { fit: TableFitResult; placement: CellPlacement };
+  /** Background the unit's masks are painted in. */
+  background?: BlockBackground;
+  /**
+   * Run-in label (STRUCTURED_LABEL / SIDEBAR_LABEL split off a paragraph):
+   * whether it fits beside its paragraph, how wide it is, and the baseline
+   * of that paragraph's first line once the paragraph has been laid out.
+   */
+  label?: { inline: boolean; width: number; baseline: number | null };
+}
+
+/**
+ * How a run-in label pairs with its paragraph: the label is drawn on the
+ * paragraph's first baseline and the paragraph's first line is indented by
+ * the label's width plus the structured gap. A label too wide for that
+ * (over RUN_IN_LABEL_MAX_SHARE of the paragraph width at its floor size)
+ * goes on a line of its own and pushes the paragraph down one line.
+ */
+interface LabelPairing {
+  labelLayout: UnitLayout;
+  labelBlock: TextBlock;
+  /** True when the source set label and paragraph on one line. */
+  sourceInline: boolean;
 }
 
 /**
@@ -686,6 +1170,7 @@ function layoutTableCell(translation: string, block: TextBlock, cell: TableCellI
     fontSize: fit.fontSize,
     lineHeight: fit.lineHeight,
     parts: new Map([[block.id, fit.lines]]),
+    segmentParts: new Map(),
     fits: fit.fits,
     extended: false,
     overflow: fit.overflow,
@@ -733,34 +1218,217 @@ function keepFootnoteMarker(unit: TranslationBlock, translation: string): string
   return `${marker} ${t}`;
 }
 
+/** A unit that visibly continues a paragraph started elsewhere gets no indent. */
+function continuesParagraph(unit: TranslationBlock): boolean {
+  return /^[a-z,;:)\]]/.test(unit.text.trimStart());
+}
+
+/**
+ * Paragraph path: resolve the typography, rebuild the inline citation
+ * markers, then fit the translation into the source boxes.
+ *
+ * The translation string itself is never rewritten — only split into runs and
+ * respaced — so the text that was sent (and its cache key) stays untouched.
+ */
+interface LayoutUnitOptions {
+  /** Container the unit lives in (sidebar typography reference). */
+  container?: LayoutContainer | null;
+  /** Run-in label of this paragraph (already laid out), for the first-line indent. */
+  pairing?: LabelPairing | null;
+  /** A label unit: the width it may take beside its paragraph (points), 0 for the block's own width. */
+  labelMaxWidth?: number;
+  /** Empty page above the first source box and under the last one (pdf/render.ts spaceAround). */
+  space?: BlockSpace;
+}
+
 function layoutUnit(
   unit: TranslationBlock,
   translation: string,
   sources: readonly TextBlock[],
   pageById: ReadonlyMap<number, PageDebugInfo>,
   mixed: MixedFont,
+  bodyFontSize: number,
+  options: LayoutUnitOptions = {},
 ): UnitLayout {
-  const { text, replaced } = sanitizeForFont(keepFootnoteMarker(unit, translation), mixed);
-  const boxes: BoxSpec[] = sources.map((b) => {
-    const pageInfo = pageById.get(b.page);
-    return { width: b.width, height: b.height, maxExtension: pageInfo ? extensionFor(b, pageInfo) : 0 };
+  const first = sources[0];
+  const spec = typographyFor({
+    type: unit.type,
+    role: roleOf(unit),
+    sourceFontSize: first.fontSize,
+    bodyFontSize,
+    containerBodyFontSize: options.container?.bodyFontSize,
+    blockHeight: first.height,
+    blockWidth: options.labelMaxWidth ? Math.max(first.width, options.labelMaxWidth) : first.width,
+    isContinuation: continuesParagraph(unit),
   });
-  const originalFontSize = sources[0].fontSize;
-  const result = fitTextToBoxes(text, boxes, originalFontSize, mixed);
+
+  // Script runs: the raised citation markers the source carried (plus a
+  // trailing one the model may have dropped) and its lowered subscripts.
+  const markers = unit.superscripts ?? [];
+  const lowered = unit.subscripts ?? [];
+  const tail = trailingMarker(unit.text);
+  const restore = tail && markers.some((m) => m.text === tail) ? tail : null;
+  const raw = buildInlineSegments(keepFootnoteMarker(unit, translation), markers, restore, lowered);
+
+  let replaced = 0;
+  let fallbackGlyphs = 0;
+  const segments: InlineSegment[] = [];
+  for (const seg of raw) {
+    const clean = sanitizeForFont(seg.text, mixed);
+    replaced += clean.replaced;
+    fallbackGlyphs += mixed.fallbackCount(clean.text);
+    if (clean.text.length > 0) {
+      segments.push(seg.sub ? { text: clean.text, sup: seg.sup, sub: true } : { text: clean.text, sup: seg.sup });
+    }
+  }
+  // The marker was put back when the model's own output did not contain it.
+  const markerRestored = restore !== null && !translation.includes(restore);
+
+  // A paragraph that opens with a run-in label: its first line starts after
+  // the label (inline) or one line lower (label on its own line); the
+  // structured section gap slides the whole paragraph down like a heading.
+  const pairing = options.pairing ?? null;
+  let firstLineIndent = spec.firstLineIndent;
+  let topOffset = spec.spaceBefore;
+  let extraExtension = 0;
+  let slide = spec.slideDown;
+  if (pairing) {
+    const label = pairing.labelLayout;
+    const labelSize = label.spec?.fontSize ?? first.fontSize;
+    const gap = TYPOGRAPHY.spacing.structuredLabelAfter * labelSize;
+    const inline = pairing.sourceInline && (label.label?.inline ?? false);
+    const sectionGap = Math.min(TYPOGRAPHY.spacing.structuredSectionGap * spec.fontSize, label.spec?.spaceBefore ?? 0);
+    if (inline) {
+      firstLineIndent = Math.max(0, pairing.labelBlock.x + (label.label?.width ?? 0) + gap - first.x);
+      topOffset = sectionGap;
+    } else {
+      firstLineIndent = 0;
+      topOffset = sectionGap + labelSize * (label.spec?.lineHeightRatio ?? 1.3);
+    }
+    extraExtension = topOffset;
+    slide = true;
+  }
+
+  const lastIndex = sources.length - 1;
+  const buildBoxes = (headroom: number, slideBy: number, roomBelow: number | null): BoxSpec[] =>
+    sources.map((b, i) => {
+      const pageInfo = pageById.get(b.page);
+      let extension = (pageInfo ? extensionFor(b, pageInfo) : 0) + (i === lastIndex ? extraExtension : 0);
+      if (roomBelow !== null && i === lastIndex) extension = Math.min(extension, Math.max(0, roomBelow - slideBy));
+      const before = i === 0 ? spec.spaceBefore : 0;
+      const after = i === lastIndex ? spec.spaceAfter : 0;
+      // slideDown roles keep their box and move into the gap above them; the
+      // others pay for the paragraph gap out of their own height.
+      const height = (slide ? b.height : Math.max(1, b.height - before - after)) + (i === 0 ? headroom : 0);
+      let width = i === 0 && options.labelMaxWidth ? Math.max(b.width, options.labelMaxWidth) : b.width;
+      // A label the source set in a narrow box may use the free width beside
+      // it: its own box is narrow because the English word was short, and one
+      // line across the column beats three lines over the text below.
+      if (i === 0 && spec.narrowBox && space) width += space.right;
+      return {
+        width,
+        height,
+        maxExtension: extension,
+        firstLineIndent: i === 0 ? firstLineIndent : 0,
+      };
+    });
+
+  // A heading is raised above the body size and slides down by its space
+  // before, which together need about twice the height of the single line the
+  // source set it on. Where the next paragraph starts right under that line
+  // there is no room for either, and the heading used to be drawn straight
+  // over it. So the space that is actually free decides, in this order:
+  // slide only as far as it reaches, then give up the size floor down to the
+  // body size (the weight still carries the hierarchy), then take the space
+  // above instead of the space below.
+  const spaceBoundRole = spec.role === 'heading' || spec.role === 'title' || LABEL_TYPOGRAPHY_ROLES.has(spec.role);
+  const space = spaceBoundRole ? options.space : undefined;
+  const roomBelow = space ? Math.max(0, space.below - HEADING_CLEARANCE) : null;
+  const roomAbove = space ? Math.max(0, space.above - HEADING_CLEARANCE) : 0;
+  const bodyFloor = Math.min(spec.minFontSize, Math.max(bodyFontSize, TYPOGRAPHY.fit.minFontSizeAbs));
+  if (roomBelow !== null) slide = true; // the heading keeps its box; the room decides how far it may move
+  const slideBy = roomBelow === null ? topOffset : Math.min(topOffset, roomBelow);
+  const attempts: Array<{ headroom: number; slideBy: number; minFontSize: number }> =
+    roomBelow === null
+      ? [{ headroom: 0, slideBy: topOffset, minFontSize: spec.minFontSize }]
+      : [
+          { headroom: 0, slideBy, minFontSize: spec.minFontSize },
+          { headroom: 0, slideBy, minFontSize: bodyFloor },
+          { headroom: Math.min(roomAbove, spec.fontSize * spec.lineHeightRatio), slideBy: 0, minFontSize: bodyFloor },
+        ];
+
+  let attempt = attempts[0];
+  let result = fitTextToBoxes(segments, buildBoxes(attempt.headroom, attempt.slideBy, roomBelow), spec.fontSize, mixed, attempt.minFontSize, spec.lineHeightRatio);
+  for (let i = 1; i < attempts.length && !result.fits; i++) {
+    attempt = attempts[i];
+    result = fitTextToBoxes(segments, buildBoxes(attempt.headroom, attempt.slideBy, roomBelow), spec.fontSize, mixed, attempt.minFontSize, spec.lineHeightRatio);
+  }
+  topOffset = attempt.slideBy - attempt.headroom;
+
+  // Collision guard: the ink of the last box, measured where it will really
+  // be drawn. Everything above has already given up the size floor and the
+  // slide, so a hit here means the text cannot be made to fit at all; it is
+  // drawn (text is never cut) and reported.
+  let collision = false;
+  if (roomBelow !== null) {
+    const last = sources[lastIndex];
+    const drawnHeight = result.parts[lastIndex]?.totalHeight ?? 0;
+    const inkBottom = (lastIndex === 0 ? last.top - topOffset : last.top) - drawnHeight;
+    collision = inkBottom < last.y - roomBelow - 1e-6;
+  }
   const parts = new Map<string, string[]>();
-  sources.forEach((b, i) => parts.set(b.id, result.parts[i]?.lines ?? []));
+  const segmentParts = new Map<string, InlineSegment[][]>();
+  sources.forEach((b, i) => {
+    parts.set(b.id, result.parts[i]?.lines ?? []);
+    segmentParts.set(b.id, result.parts[i]?.segmentLines ?? []);
+  });
+  const superscriptRuns = segments.filter((seg) => seg.sup).length;
+  const subscriptRuns = segments.filter((seg) => seg.sub === true).length;
   return {
     fontSize: result.fontSize,
     lineHeight: result.lineHeight,
     parts,
+    segmentParts,
     fits: result.fits,
     extended: result.extended,
     overflow: result.overflow,
     replaced,
-    fallbackGlyphs: mixed.fallbackCount(text),
+    fallbackGlyphs,
     iterations: result.iterations,
     minFontSize: result.minFontSize,
+    spaceBound: roomBelow !== null,
+    collision,
+    spec,
+    topOffset,
+    firstLineIndent,
+    superscriptRuns,
+    subscriptRuns,
+    markerRestored,
   };
+}
+
+/**
+ * Lay out a run-in label: a single line at the label typography, allowed to
+ * take up to RUN_IN_LABEL_MAX_SHARE of its paragraph's width. When even the
+ * floor size needs more than that (or a second line), the label is set on a
+ * line of its own.
+ */
+function layoutLabelUnit(
+  unit: TranslationBlock,
+  translation: string,
+  label: TextBlock,
+  paragraph: TextBlock,
+  pageById: ReadonlyMap<number, PageDebugInfo>,
+  mixed: MixedFont,
+  bodyFontSize: number,
+  container: LayoutContainer | null,
+): UnitLayout {
+  const maxWidth = Math.max(label.width, RUN_IN_LABEL_MAX_SHARE * paragraph.width);
+  const result = layoutUnit(unit, translation, [label], pageById, mixed, bodyFontSize, { container, labelMaxWidth: maxWidth });
+  const lines = result.segmentParts.get(label.id) ?? [];
+  const width = lines.length ? measureSegments(lines[0], mixed, result.fontSize) : 0;
+  const inline = lines.length === 1 && width <= RUN_IN_LABEL_MAX_SHARE * paragraph.width + 1e-6;
+  return { ...result, label: { inline, width, baseline: null } };
 }
 
 // ---------------------------------------------------------------------------
@@ -826,8 +1494,19 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
   // 3. indices ---------------------------------------------------------------
   const blockById = new Map(layout.blocks.map((b) => [b.id, b]));
   const pageById = new Map(analysis.pages.map((p) => [p.pageNumber, p]));
+  const containerById = new Map(layout.containers.map((c) => [c.id, c]));
+  const blocksByPage = new Map<number, TextBlock[]>();
+  for (const b of layout.blocks) {
+    const list = blocksByPage.get(b.page);
+    if (list) list.push(b);
+    else blocksByPage.set(b.page, [b]);
+  }
   const selectedPages = options.pages ?? new Set(analysis.pages.map((p) => p.pageNumber));
   const units = layout.translationBlocks.filter((u) => !options.unitIds || options.unitIds.has(u.id));
+  /** Unit that owns a block (first source block only: the pairing of a label with its paragraph). */
+  const unitByFirstBlock = new Map<string, TranslationBlock>();
+  for (const unit of units) unitByFirstBlock.set(unit.sourceBlockIds[0], unit);
+  const debugRoles = options.debugRoles !== false;
   const unitsByPage = new Map<number, TranslationBlock[]>();
   for (const unit of units) {
     const pages = new Set(unit.sourceBlockIds.map((id) => blockById.get(id)?.page).filter((p): p is number => !!p));
@@ -853,6 +1532,35 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
     figureCells: 0,
     figureCellsWritten: 0,
     figureCellsOverflow: 0,
+    typography: {
+      titles: 0,
+      headings: 0,
+      sizeBoosted: 0,
+      boldDrawn: 0,
+      floorApplied: 0,
+      headingsSpaceBound: 0,
+      headingCollisions: 0,
+      minHeadingBodyRatio: 0,
+      indentedParagraphs: 0,
+      spacedParagraphs: 0,
+      superscriptRuns: 0,
+      superscriptUnits: 0,
+      subscriptRuns: 0,
+      subscriptUnits: 0,
+      superscriptRestored: 0,
+    },
+    layoutRoles: {
+      structuredLabels: 0,
+      sidebarHeadings: 0,
+      sidebarLabels: 0,
+      sidebarBodies: 0,
+      inlineLabels: 0,
+      ownLineLabels: 0,
+      contrastShortfall: 0,
+      containerMasks: 0,
+      tintedMasks: 0,
+      lightTextUnits: 0,
+    },
   };
   /** Layout blocks that are logical table cells (for the debug PDF). */
   const cellBlocks = layout.blocks.filter((b) => b.cell !== undefined);
@@ -864,6 +1572,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
       sourceBlockIds: unit.sourceBlockIds,
       page: unit.page,
       type: unit.type,
+      role: roleOf(unit),
       fontSize: blockById.get(unit.sourceBlockIds[0])?.fontSize ?? 0,
       finalFontSize: null,
       lines: 0,
@@ -874,6 +1583,22 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
       fallbackGlyphs: 0,
     });
     stats.unitsSkipped++;
+  };
+
+  /** A run-in label's paragraph: the pairing the paragraph is laid out with, once the label has a layout. */
+  const pairingFor = (paragraph: TextBlock): LabelPairing | null => {
+    if (!paragraph.labelBlockId) return null;
+    const labelBlock = blockById.get(paragraph.labelBlockId);
+    const labelUnit = labelBlock ? unitByFirstBlock.get(labelBlock.id) : undefined;
+    if (!labelBlock || !labelUnit) return null;
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    const labelLayout = getLayout(labelUnit);
+    if (!labelLayout?.label) return null;
+    const sourceInline =
+      labelBlock.lines.length > 0 &&
+      paragraph.lines.length > 0 &&
+      Math.abs(labelBlock.lines[0].y - paragraph.lines[0].y) <= 0.5 * Math.max(labelBlock.fontSize, paragraph.fontSize);
+    return { labelLayout, labelBlock, sourceInline };
   };
 
   /** Fit a unit once; null when it cannot be written. */
@@ -913,6 +1638,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
                 sourceBlockIds: unit.sourceBlockIds,
                 page: unit.page,
                 type: unit.type,
+                role: roleOf(unit),
                 cell: {
                   kind: cell.kind,
                   tableId: cell.tableId,
@@ -937,7 +1663,33 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
               console.warn(`[PDF Render Warning] block=${unit.id} reason=CELL_OVERFLOW (${message})`);
             }
           } else {
-            result = layoutUnit(unit, entry.translation, sources, pageById, mixed as MixedFont);
+            const first = sources[0];
+            const container = first.containerId ? (containerById.get(first.containerId) ?? null) : null;
+            const paragraph = first.labelFor ? blockById.get(first.labelFor) : undefined;
+            if (paragraph && sources.length === 1) {
+              result = layoutLabelUnit(unit, entry.translation, first, paragraph, pageById, mixed as MixedFont, layout.bodyFontSize, container);
+            } else {
+              const pairing = pairingFor(first);
+              // Headings and labels are fitted against the space they really
+              // have; layoutUnit ignores it for the other roles.
+              const pageInfo = pageById.get(first.page);
+              const space = pageInfo
+                  ? spaceAround(sources[sources.length - 1], blocksByPage.get(first.page) ?? [], pageInfo)
+                  : undefined;
+              result = layoutUnit(unit, entry.translation, sources, pageById, mixed as MixedFont, layout.bodyFontSize, { container, pairing, space });
+              if (pairing) {
+                // The label shares the paragraph's first baseline (inline) or sits one line above it.
+                const inline = pairing.sourceInline && pairing.labelLayout.label?.inline;
+                const labelSize = pairing.labelLayout.fontSize;
+                const firstBaseline = first.top - (result.topOffset ?? 0) - GLYPH_ASCENT * result.fontSize;
+                const lineHeight = labelSize * (pairing.labelLayout.spec?.lineHeightRatio ?? 1.3);
+                if (pairing.labelLayout.label) {
+                  pairing.labelLayout.label.baseline = inline ? firstBaseline : firstBaseline + lineHeight;
+                }
+              }
+            }
+            const background = getBackgroundForBlock(first, pageById.get(first.page) as PageDebugInfo, containerById);
+            result.background = background;
           }
         } catch (err) {
           skip(unit, 'FIT_FAILED', err instanceof Error ? err.message : String(err));
@@ -989,6 +1741,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
 
     if (mode === 'debug') {
       drawDebugPage(target, pageInfo, pageUnits, blockById, labelFont as PDFFont, cellBlocks);
+      if (debugRoles) drawDebugRoles(target, pageInfo, layout, labelFont as PDFFont);
       if (shifted) target.pushOperators(popGraphicsState());
       return;
     }
@@ -1007,7 +1760,13 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
           stats.masksDrawn += drawCellMasks(target, block, block.cell, pageInfo);
           continue;
         }
-        for (const line of block.lines) if (drawLineMask(target, line, pageInfo)) stats.masksDrawn++;
+        const background = (getLayout(unit) as UnitLayout).background ?? getBackgroundForBlock(block, pageInfo, containerById);
+        for (const line of block.lines) {
+          if (!drawLineMask(target, line, pageInfo, background)) continue;
+          stats.masksDrawn++;
+          if (background.source === 'container') stats.layoutRoles.containerMasks++;
+          else if (background.source !== 'white') stats.layoutRoles.tintedMasks++;
+        }
       }
     }
 
@@ -1025,6 +1784,7 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
           sourceBlockIds: unit.sourceBlockIds,
           page: unit.page,
           type: unit.type,
+          role: roleOf(unit),
           fontSize: firstBlock?.fontSize ?? 0,
           finalFontSize: unitLayout.fontSize,
           lines: [...unitLayout.parts.values()].reduce((n, l) => n + l.length, 0),
@@ -1035,6 +1795,33 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
           fallbackGlyphs: unitLayout.fallbackGlyphs,
         };
         const notes: string[] = [];
+        if (unitLayout.spec && firstBlock) {
+          const lines = unitLayout.parts.get(firstBlock.id)?.length ?? 0;
+          const top = unitLayout.label?.baseline !== null && unitLayout.label?.baseline !== undefined
+            ? unitLayout.label.baseline + GLYPH_ASCENT * unitLayout.fontSize
+            : firstBlock.top - (unitLayout.topOffset ?? 0);
+          const height = lines > 0 ? (lines - 1) * unitLayout.lineHeight + unitLayout.fontSize * (GLYPH_ASCENT + GLYPH_DESCENT) : 0;
+          existing.extent = { top: Math.round(top * 100) / 100, bottom: Math.round((top - height) * 100) / 100 };
+        }
+        if (unitLayout.background) {
+          const bg = unitLayout.background;
+          existing.background = { color: bg.color, source: bg.source, light: bg.light };
+          if (bg.light) {
+            stats.layoutRoles.lightTextUnits++;
+            notes.push(`drawn in white on ${bg.color}`);
+          } else if (bg.source === 'container') notes.push(`masked in the container fill ${bg.color ?? 'white'}`);
+          else if (bg.source === 'fill' && bg.color) notes.push(`masked in the fill ${bg.color}`);
+        }
+        const role = roleOf(unit);
+        const lr = stats.layoutRoles;
+        if (role === 'STRUCTURED_LABEL') lr.structuredLabels++;
+        else if (role === 'SIDEBAR_HEADING') lr.sidebarHeadings++;
+        else if (role === 'SIDEBAR_LABEL') lr.sidebarLabels++;
+        else if (role === 'SIDEBAR_BODY') lr.sidebarBodies++;
+        if (unitLayout.label) {
+          if (unitLayout.label.inline) lr.inlineLabels++;
+          else lr.ownLineLabels++;
+        }
         if (unitLayout.table && firstBlock?.cell) {
           const cell = firstBlock.cell;
           existing.cell = {
@@ -1052,6 +1839,59 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
           if (unitLayout.fontSize < cell.fontSize) notes.push(`${what} shrunk from ${cell.fontSize} pt to ${unitLayout.fontSize} pt`);
           if (unitLayout.lineHeight < unitLayout.fontSize * 1.1) notes.push('tight cell line height');
           if (cell.textOnDark) notes.push(`drawn in white on ${cell.background ?? 'a dark background'}`);
+        }
+        const spec = unitLayout.spec;
+        if (spec) {
+          const runs = unitLayout.superscriptRuns ?? 0;
+          const lowRuns = unitLayout.subscriptRuns ?? 0;
+          existing.typography = {
+            role: spec.role,
+            startFontSize: spec.fontSize,
+            minFontSize: spec.minFontSize,
+            bodyRatio: layout.bodyFontSize > 0 ? Math.round((unitLayout.fontSize / layout.bodyFontSize) * 100) / 100 : 0,
+            bold: spec.bold,
+            firstLineIndent: spec.firstLineIndent,
+            spaceBefore: spec.spaceBefore,
+            spaceAfter: spec.spaceAfter,
+            superscripts: runs,
+            subscripts: lowRuns > 0 ? lowRuns : undefined,
+            contrast: spec.contrast.length ? [...spec.contrast] : undefined,
+            labelPlacement: unitLayout.label ? (unitLayout.label.inline ? 'inline' : 'own-line') : undefined,
+          };
+          if (!hasRequiredContrast(spec)) {
+            stats.layoutRoles.contrastShortfall++;
+            notes.push(`label keeps only ${spec.contrast.length} contrast(s) to the body text`);
+          }
+          const t = stats.typography;
+          if (spec.role === 'title') t.titles++;
+          if (spec.role === 'heading') t.headings++;
+          if (spec.bold) t.boldDrawn++;
+          if (spec.boosted) t.sizeBoosted++;
+          if (spec.role === 'title' || spec.role === 'heading') {
+            const ratio = existing.typography.bodyRatio;
+            t.minHeadingBodyRatio = t.minHeadingBodyRatio === 0 ? ratio : Math.min(t.minHeadingBodyRatio, ratio);
+            if (unitLayout.fontSize <= spec.minFontSize + 1e-6) t.floorApplied++;
+            if (unitLayout.spaceBound) t.headingsSpaceBound++;
+            if (unitLayout.collision) {
+              t.headingCollisions++;
+              notes.push('still reaches the block below');
+            }
+          }
+          if (spec.firstLineIndent > 0) t.indentedParagraphs++;
+          if (spec.spaceBefore > 0 || spec.spaceAfter > 0) t.spacedParagraphs++;
+          if (runs > 0) {
+            t.superscriptUnits++;
+            t.superscriptRuns += runs;
+          }
+          if (lowRuns > 0) {
+            t.subscriptUnits++;
+            t.subscriptRuns += lowRuns;
+          }
+          if (unitLayout.markerRestored) t.superscriptRestored++;
+          if (spec.boosted) notes.push(`${spec.role} raised from ${firstBlock?.fontSize ?? spec.fontSize} pt to ${spec.fontSize} pt`);
+          if (runs > 0) notes.push(`${runs} citation marker(s) drawn as superscript`);
+          if (lowRuns > 0) notes.push(`${lowRuns} run(s) drawn as subscript`);
+          if (unitLayout.markerRestored) notes.push('trailing citation marker restored');
         }
         if (!unitLayout.fits) {
           existing.warning = true;
@@ -1074,17 +1914,29 @@ export async function generateTranslatedPdf(options: RenderOptions): Promise<Ren
         const block = blockById.get(id);
         if (!block || block.page !== pageNumber) continue;
         const lines = unitLayout.parts.get(id) ?? [];
+        const spec = unitLayout.spec;
+        const isFirstBox = id === unit.sourceBlockIds[0];
         const outcome = unitLayout.table
           ? drawTableCellText(writer, unitLayout.table.placement, unitLayout.fontSize, mixed as MixedFont, block.cell?.textOnDark === true)
           : drawBlockText(
               writer,
               block,
               pageInfo,
-              lines,
+              unitLayout.segmentParts.get(id) ?? [],
               unitLayout.fontSize,
               unitLayout.lineHeight,
               mixed as MixedFont,
-              isCenteredBlock(block, pageInfo),
+              isCenteredBlock(block, pageInfo, blocksByPage.get(block.page) ?? []),
+              {
+                // Paragraph space and indent belong to the first box only; a
+                // continuation box carries the rest of the same paragraph.
+                topOffset: isFirstBox ? (unitLayout.topOffset ?? 0) : 0,
+                firstLineIndent: isFirstBox ? (unitLayout.firstLineIndent ?? spec?.firstLineIndent ?? 0) : 0,
+                bold: spec?.bold ?? false,
+                boldStrokeRatio: spec?.boldStrokeRatio ?? 0,
+                light: unitLayout.background?.light === true,
+                baselineOverride: isFirstBox ? (unitLayout.label?.baseline ?? undefined) : undefined,
+              },
             );
         if (outcome.error) {
           existing.warning = true;

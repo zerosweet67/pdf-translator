@@ -137,14 +137,24 @@ export class AnthropicProvider implements TranslationProvider {
       throw new ProviderError(502, 'invalid_json', 'Model returned invalid JSON.');
     }
 
-    const cached = (response.usage as { cache_read_input_tokens?: number | null }).cache_read_input_tokens ?? 0;
+    // Anthropic reports cache reads and cache writes outside input_tokens, so both are
+    // added back to get the real prompt size. Only the cache *read* counts as cached.
+    // Thinking tokens are billed inside output_tokens and are not broken out, so
+    // reasoningTokens stays 0 here rather than being estimated.
+    const u = response.usage as {
+      cache_read_input_tokens?: number | null;
+      cache_creation_input_tokens?: number | null;
+    };
+    const cached = u.cache_read_input_tokens ?? 0;
+    const cacheWrite = u.cache_creation_input_tokens ?? 0;
     return {
       parsed,
       model: response.model,
       usage: {
-        inputTokens: response.usage.input_tokens + cached,
+        inputTokens: response.usage.input_tokens + cached + cacheWrite,
         outputTokens: response.usage.output_tokens,
         cachedInputTokens: cached,
+        reasoningTokens: 0,
       },
     };
   }

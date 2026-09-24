@@ -70,8 +70,21 @@ export interface QaPolicyStats {
 export interface DocumentTranslationOptions extends Omit<TranslateBlocksOptions, 'terms'> {
   /** Developer Mode terminology map ("english term = 中文"); overrides automatic entries. */
   userTerminology?: Record<string, string> | null;
-  /** Whole document, for terminology sampling; defaults to `blocks`. */
+  /** Units to sample terminology from (the selected scope plus title / abstract); defaults to `blocks`. */
   documentBlocks?: readonly TranslationBlock[];
+  /**
+   * Key of the per-session terminology cache: document fingerprint + scope
+   * fingerprint (main.ts). The same scope of the same document reuses its
+   * extraction. Defaults to the fingerprint of `documentBlocks`.
+   */
+  terminologyCacheKey?: string;
+  /**
+   * Key of the document the scope belongs to. Auto terms extracted for other
+   * scopes of the same document are kept and merged in, so a chapter translated
+   * later uses the same renderings as the chapters before it. Defaults to
+   * `terminologyCacheKey`.
+   */
+  terminologyDocumentKey?: string;
   /** Automatic glossary extraction (default true). */
   terminologyExtraction?: boolean;
   /** Second-pass QA of hard-risk blocks (default true). */
@@ -97,11 +110,28 @@ export interface DocumentTranslationResult {
   warnings: string[];
 }
 
-/** Auto terminology per document fingerprint, for this page session only (spec §8). */
+/** Auto terminology per (document, scope) fingerprint, for this page session only (spec §8). */
 const terminologyCache = new Map<string, TermEntry[]>();
+/** Union of the auto terms extracted so far per document (all scopes), for consistent renderings. */
+const documentTerms = new Map<string, TermEntry[]>();
 
 export function clearTerminologyCache(): void {
   terminologyCache.clear();
+  documentTerms.clear();
+}
+
+/** `base` first, then the entries of `extra` whose term / abbreviation is not taken yet (all auto). */
+function unionAutoTerms(base: readonly TermEntry[], extra: readonly TermEntry[]): TermEntry[] {
+  const taken = new Set<string>();
+  const out: TermEntry[] = [];
+  for (const t of [...base, ...extra]) {
+    const key = t.source.toLowerCase();
+    if (taken.has(key) || (t.abbreviation && taken.has(t.abbreviation.toLowerCase()))) continue;
+    taken.add(key);
+    if (t.abbreviation) taken.add(t.abbreviation.toLowerCase());
+    out.push(t);
+  }
+  return out;
 }
 
 async function extractDocumentTerminology(
@@ -109,31 +139,37 @@ async function extractDocumentTerminology(
   options: DocumentTranslationOptions,
   stats: TerminologyStats,
 ): Promise<TermEntry[]> {
-  const fingerprint = documentFingerprint(documentBlocks);
+  const fingerprint = options.terminologyCacheKey ?? documentFingerprint(documentBlocks);
+  const documentKey = options.terminologyDocumentKey ?? fingerprint;
+  const known = documentTerms.get(documentKey) ?? [];
   const cached = terminologyCache.get(fingerprint);
   if (cached) {
     stats.cached = true;
-    stats.autoTerms = cached.length;
-    return cached;
+    const merged = unionAutoTerms(known, cached);
+    documentTerms.set(documentKey, merged);
+    stats.autoTerms = merged.length;
+    return merged;
   }
   const samples = selectTerminologySamples(documentBlocks);
   stats.samples = samples.length;
   stats.sampleChars = samples.reduce((n, s) => n + s.length, 0);
-  if (samples.length === 0) return [];
+  if (samples.length === 0) return known;
   const started = performance.now();
   try {
     const response = await options.client.extractTerminology(samples);
     stats.requests++;
     stats.usage = response.usage ?? null;
     const terms = parseTerminologyResponse({ terms: response.terms });
-    stats.autoTerms = terms.length;
     terminologyCache.set(fingerprint, terms);
-    return terms;
+    const merged = unionAutoTerms(known, terms);
+    documentTerms.set(documentKey, merged);
+    stats.autoTerms = merged.length;
+    return merged;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     stats.warnings.push(`Terminology extraction failed; translating without an automatic glossary. (${message})`);
     console.warn('[Terminology] extraction failed, continuing without auto terminology', err);
-    return [];
+    return known;
   } finally {
     stats.durationMs = Math.round(performance.now() - started);
   }

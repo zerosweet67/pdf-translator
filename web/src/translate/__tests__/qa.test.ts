@@ -68,12 +68,12 @@ function fakeClient(options: {
   const client = {
     async translate(blocks: WorkerBlockInput[]): Promise<WorkerTranslateResponse> {
       translateCalls.push(blocks);
-      return { blocks: blocks.map((b) => ({ id: b.id, translation: `譯：${b.text}` })), missing: [], usage: { inputTokens: 100, outputTokens: 80, cachedInputTokens: 0 } };
+      return { blocks: blocks.map((b) => ({ id: b.id, translation: `譯：${b.text}` })), missing: [], usage: { inputTokens: 100, outputTokens: 80, cachedInputTokens: 0, reasoningTokens: 0 } };
     },
     async extractTerminology() {
       terminologyCalls++;
       if (options.terminology === 'fail') throw new TranslateClientError('http', 'boom', { status: 502 });
-      return { terms: options.terminology?.terms ?? [], usage: { inputTokens: 300, outputTokens: 60, cachedInputTokens: 0 } };
+      return { terms: options.terminology?.terms ?? [], usage: { inputTokens: 300, outputTokens: 60, cachedInputTokens: 0, reasoningTokens: 0 } };
     },
     async reviewTranslations(items: WorkerQaItem[]): Promise<WorkerQaResponse> {
       qaCalls.push(items);
@@ -89,7 +89,7 @@ function fakeClient(options: {
           const v = options.verdicts?.[i.id] ?? { ok: true, translation: null, issues: [] };
           return { id: i.id, ok: v.ok, translation: v.translation, issues: v.issues ?? [] };
         });
-      return { blocks, missing: [], usage: { inputTokens: 200, outputTokens: 20, cachedInputTokens: 0 }, providerCalls: 1 };
+      return { blocks, missing: [], usage: { inputTokens: 200, outputTokens: 20, cachedInputTokens: 0, reasoningTokens: 0 }, providerCalls: 1 };
     },
   } as unknown as TranslateClient;
   return { client, translateCalls, qaCalls, terminologyCalls: () => terminologyCalls };
