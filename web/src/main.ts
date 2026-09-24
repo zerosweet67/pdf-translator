@@ -2174,7 +2174,8 @@ function setJobProgress(step: JobStep, percent: number, label: string): void {
 }
 
 /**
- * User Mode: the job's actual token usage and how long translating took.
+ * How long translating took. The token count beside it is Developer Mode only
+ * (?debug=true); User Mode never sees usage numbers.
  * Hidden when no provider reported usage, so no estimate is ever shown.
  */
 function renderJobUsage(): void {
@@ -2187,7 +2188,9 @@ function renderJobUsage(): void {
   }
   const seconds = Math.max(1, Math.round(snapshot.totalDurationMs / 1000));
   jobUsageEl.replaceChildren(
-    el('span', undefined, `本次 Token 使用量：${formatTokens(snapshot.totalProcessedTokens)}`),
+    ...(DEBUG_MODE
+      ? [el('span', undefined, `本次 Token 使用量：${formatTokens(snapshot.totalProcessedTokens)}`)]
+      : []),
     el('span', undefined, `翻譯時間：${seconds} 秒`),
   );
   jobUsageEl.hidden = false;
